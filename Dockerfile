@@ -55,7 +55,8 @@ LABEL org.opencontainers.image.source="https://github.com/cypher-propel/google-s
 # Remove the base's bootstrap tooling. Only the separately audited, pinned pip
 # in /opt/venv remains for exact final-runtime pip check/freeze/inspect evidence.
 RUN python -c 'import os,re; assert re.fullmatch(r"unknown|[a-f0-9]{40}",os.environ["GOOGLE_SEO_REVISION"]), "Invalid release revision"' \
-    && python -m pip uninstall --yes pip setuptools wheel \
+    && python -m pip uninstall --yes pip setuptools wheel packaging \
+    && python -c 'from importlib.metadata import distributions; names=[d.metadata["Name"] for d in distributions()]; assert not names, "Unexpected global Python distributions: "+repr(names)' \
     && mkdir -p /app \
     && chmod 0555 /app
 COPY --from=wheel-builder /opt/venv /opt/venv
