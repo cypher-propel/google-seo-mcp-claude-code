@@ -205,6 +205,44 @@ def serp_paa_extractor(
     )
 
 
+def _identity_hostname(value: Any, *, allow_bare: bool = False) -> str | None:
+    """Parse observation identity locally; never resolve or fetch a URL.
+
+    Only legacy targets may be bare hosts. Explicit labels (including www)
+    remain part of the identity; a single DNS root dot is insignificant.
+    """
+    if (not isinstance(value, str) or not value
+            or any(ord(char) < 33 or ord(char) == 127 for char in value)):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if allow_bare and "://" not in value and not value.startswith("//"):
+            parsed = urlsplit("//" + value)
+        elif parsed.scheme not in ("http", "https"):
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        _ = parsed.port  # Invalid ports are malformed observations, not identities.
+        host = parsed.hostname
+        if not host:
+            return None
+        host = host.lower().removesuffix(".")
+        if (not host or host.startswith(".") or host.endswith(".")
+                or ".." in host or re.search(r"[\s/@\\?#%]", host)):
+            return None
+        return host
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _matches_hostname(result_url: Any, target_host: str | None) -> bool:
+    """Match an exact host or a genuine dot-boundary subdomain."""
+    result_host = _identity_hostname(result_url)
+    return bool(target_host and result_host and (
+        result_host == target_host or result_host.endswith("." + target_host)
+    ))
+
+
 def serp_competitor_intersect(
     keyword: str,
     your_url: str,
@@ -243,10 +281,10 @@ def serp_competitor_intersect(
     summary = _summarise_serp(resp, keyword=keyword)
     organic = summary["organic"][:10]
 
-    your_host = your_url.split("//")[-1].split("/")[0].lower()
+    your_host = _identity_hostname(your_url, allow_bare=True)
     your_position = None
     for r in organic:
-        if your_host in (r.get("url") or "").lower():
+        if _matches_hostname(r.get("url"), your_host):
             your_position = r.get("position")
             break
 
