@@ -50,7 +50,7 @@ _OPTIONAL_DEPS: list[dict[str, Any]] = [
     {
         "name": "advertools (Scrapy crawler)",
         "import_module": "advertools",
-        "installs": "pip install google-seo-mcp",  # already in core deps
+        "installs": "pip install google-seo-mcp[crawl]",
         "extra_command": None,
         "reason_when_missing": "Internal-links graph crawler depends on advertools/Scrapy.",
         "affected_tools": [

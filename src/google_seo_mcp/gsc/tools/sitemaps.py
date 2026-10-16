@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from ...auth import get_webmasters
+from ...auth import get_webmasters, is_hosted_production
 from ...guardrails import with_meta
 
 
@@ -23,6 +23,11 @@ def submit_sitemap(site_url: str, feedpath: str) -> dict:
         site_url: Property URL.
         feedpath: Full sitemap URL (e.g. https://example.com/sitemap.xml).
     """
+    if is_hosted_production():
+        return {
+            "error": "destructive_disabled",
+            "message": "Sitemap submission is unavailable in hosted production.",
+        }
     if os.getenv("GSC_ALLOW_DESTRUCTIVE") != "true":
         return {
             "error": "destructive_disabled",

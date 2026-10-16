@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from ..guardrails import with_meta
 from . import (
     generate_indexnow_key,
+    require_indexnow_enabled,
     submit_google_indexing,
     submit_indexnow,
 )
@@ -17,6 +18,7 @@ def indexnow_generate_key() -> dict:
     After getting the key, host a file at https://{your-site}/{key}.txt with the
     key as its only content. Once that's done, you can call `indexnow_submit`.
     """
+    require_indexnow_enabled()
     key = generate_indexnow_key()
     return with_meta(
         {
@@ -45,6 +47,7 @@ def indexnow_submit(
         key: The 32-char IndexNow key hosted at /{key}.txt on the site.
         key_location: Optional explicit URL to the key file (override default path).
     """
+    require_indexnow_enabled()
     # Validate all URLs share the host
     hosts = {urlparse(u).hostname for u in urls}
     if len(hosts) > 1 or (urls and site not in hosts):
@@ -74,6 +77,7 @@ def indexnow_submit_sitemap(
     Note: IndexNow accepts up to 10,000 URLs per call. Larger sitemaps must be
     chunked — we do that automatically and return one result per chunk.
     """
+    require_indexnow_enabled()
     import httpx
     from defusedxml import ElementTree as ET  # XXE-safe replacement
 

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from typing import Any
+import re
+from urllib.parse import urlsplit
 
 from ..guardrails import with_meta
-from . import SerpCredentialsMissing, call_dataforseo
+from . import (HOSTED_MAX_KEYWORDS, ORGANIC_LIVE_ENDPOINT, SerpCredentialsMissing,
+               call_dataforseo, hosted_serp_enabled, validate_hosted_keyword,
+               validate_hosted_observation)
 
 
 # Common location codes (DataForSEO uses these — full list at
@@ -35,6 +39,15 @@ def _serp_payload(
     device: str,
     language_code: str = "es",
 ) -> list[dict]:
+    if hosted_serp_enabled():
+        validate_hosted_keyword(keyword)
+        if (not isinstance(location, str) or len(location) > 7
+                or (location not in LOCATION_CODES
+                    and re.fullmatch(r"[1-9][0-9]{0,6}", location) is None)
+                or device not in ("mobile", "desktop")
+                or not isinstance(language_code, str)
+                or re.fullmatch(r"[a-z]{2}", language_code) is None):
+            raise ValueError("invalid_serp_input")
     return [{
         "keyword": keyword,
         "location_code": _resolve_location(location),
@@ -65,7 +78,7 @@ def serp_check(
     """
     try:
         resp = call_dataforseo(
-            "/serp/google/organic/live/advanced",
+            ORGANIC_LIVE_ENDPOINT,
             _serp_payload(keyword, location, device, language_code),
         )
     except SerpCredentialsMissing as e:
@@ -96,6 +109,12 @@ def serp_aio_monitor(
     your hypothesis: high-impressions, low-CTR queries with AIO present
     are the ones that need rewriting for citation, not just title tweaks.
     """
+    if hosted_serp_enabled():
+        if not isinstance(keywords, list) or not 1 <= len(keywords) <= HOSTED_MAX_KEYWORDS:
+            raise ValueError("invalid_serp_input")
+        # Validate the whole batch before its first billable request.
+        for keyword in keywords:
+            _serp_payload(keyword, location, device, language_code)
     if not keywords:
         return with_meta({"error": "keywords list is empty"}, source="serp.serp_aio_monitor")
     if len(keywords) > 100:
@@ -109,7 +128,7 @@ def serp_aio_monitor(
     for kw in keywords:
         try:
             resp = call_dataforseo(
-                "/serp/google/organic/live/advanced",
+                ORGANIC_LIVE_ENDPOINT,
                 _serp_payload(kw, location, device, language_code),
             )
             summary = _summarise_serp(resp, keyword=kw)
@@ -128,7 +147,10 @@ def serp_aio_monitor(
                 source="serp.serp_aio_monitor",
             )
         except Exception as e:  # noqa: BLE001 — collect per-query errors
-            errors.append({"keyword": kw, "error": str(e)[:200]})
+            errors.append({
+                "keyword": kw,
+                "error": "vendor_unavailable" if hosted_serp_enabled() else str(e)[:200],
+            })
 
     aio_count = sum(1 for f in findings if f["has_aio"])
     return with_meta(
@@ -163,7 +185,7 @@ def serp_paa_extractor(
     """
     try:
         resp = call_dataforseo(
-            "/serp/google/organic/live/advanced",
+            ORGANIC_LIVE_ENDPOINT,
             _serp_payload(keyword, location, device, language_code),
         )
     except SerpCredentialsMissing as e:
@@ -196,9 +218,21 @@ def serp_competitor_intersect(
     Returns top 10 organic with positions + your_url's position (if any) +
     domains above and below you.
     """
+    if hosted_serp_enabled():
+        try:
+            if not isinstance(your_url, str) or not 1 <= len(your_url) <= 2048:
+                raise ValueError
+            parsed = urlsplit(your_url)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or any(ord(char) < 33 or ord(char) == 127 for char in your_url)):
+                raise ValueError
+            _ = parsed.port  # Reject malformed ports without DNS or URL fetch.
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError("invalid_serp_input") from None
     try:
         resp = call_dataforseo(
-            "/serp/google/organic/live/advanced",
+            ORGANIC_LIVE_ENDPOINT,
             _serp_payload(keyword, location, device, language_code),
         )
     except SerpCredentialsMissing as e:
@@ -236,6 +270,10 @@ def serp_competitor_intersect(
 
 def _summarise_serp(resp: dict[str, Any], *, keyword: str) -> dict[str, Any]:
     """Extract the high-signal fields from a DataForSEO SERP response."""
+    hosted = hosted_serp_enabled()
+    # Defend this boundary as well when the transport is substituted or reused.
+    if hosted:
+        items = validate_hosted_observation(resp)
     out: dict[str, Any] = {
         "keyword": keyword,
         "has_aio": False,
@@ -244,12 +282,13 @@ def _summarise_serp(resp: dict[str, Any], *, keyword: str) -> dict[str, Any]:
         "organic": [],
         "paa": [],
         "related_searches": [],
-        "raw_status": resp.get("status_message"),
+        "raw_status": "ok" if hosted else resp.get("status_message"),
     }
-    tasks = resp.get("tasks") or []
-    if not tasks:
-        return out
-    items = (tasks[0].get("result") or [{}])[0].get("items") or []
+    if not hosted:
+        tasks = resp.get("tasks") or []
+        if not tasks:
+            return out
+        items = (tasks[0].get("result") or [{}])[0].get("items") or []
     for item in items:
         item_type = item.get("type", "")
         if item_type == "ai_overview":
