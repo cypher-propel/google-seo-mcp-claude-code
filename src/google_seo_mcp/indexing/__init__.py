@@ -18,11 +18,22 @@ GOOGLE_INDEXING_ENDPOINT = (
 )
 
 
+def require_indexnow_enabled() -> None:
+    """Independent write gate, evaluated before parsing, fetching or key work."""
+    from ..auth import is_hosted_production
+
+    if is_hosted_production():
+        raise RuntimeError("indexnow_disabled_in_production")
+    if os.getenv("GOOGLE_SEO_ALLOW_INDEXNOW") != "true":
+        raise RuntimeError("IndexNow requires GOOGLE_SEO_ALLOW_INDEXNOW=true")
+
+
 def generate_indexnow_key() -> str:
     """Generate a 32-char hex key suitable for IndexNow ownership verification.
 
     The user must host this key as <site>/<key>.txt with the key as content.
     """
+    require_indexnow_enabled()
     return secrets.token_hex(16)
 
 
@@ -42,6 +53,7 @@ def submit_indexnow(
         key: The IndexNow key hosted at https://{host}/{key}.txt.
         key_location: Optional explicit key URL if it lives at a non-default path.
     """
+    require_indexnow_enabled()
     if not urls:
         raise ValueError("urls must be non-empty")
     body: dict[str, Any] = {"host": host, "key": key, "urlList": urls}
@@ -75,8 +87,11 @@ def submit_google_indexing(
     Args:
         notification_type: URL_UPDATED | URL_DELETED.
     """
-    # Lazy import to avoid forcing google-auth load unless this is used.
-    from ..auth import _build_creds  # type: ignore
+    # Refuse production before credentials, URL processing or any outbound call.
+    from ..auth import _build_creds, is_hosted_production
+
+    if is_hosted_production():
+        raise RuntimeError("google_indexing_disabled_in_production")
 
     if notification_type not in {"URL_UPDATED", "URL_DELETED"}:
         raise ValueError("notification_type must be URL_UPDATED or URL_DELETED")

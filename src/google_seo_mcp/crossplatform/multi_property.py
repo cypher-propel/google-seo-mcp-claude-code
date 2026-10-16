@@ -4,7 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from ..auth import normalize_property
+from ..auth import hosted_auth_enabled, normalize_property
 from ..ga4.data import run_report
 from ..ga4.dates import period as ga_period
 from ..guardrails import with_meta
@@ -34,6 +34,9 @@ def multi_property_comparison(
 
     Returns a list of {property, total, breakdown} sorted by total descending.
     """
+    hosted = hosted_auth_enabled()
+    if hosted and (type(max_concurrent) is not int or not 1 <= max_concurrent <= 5):
+        raise ValueError("max_concurrent must be an integer between 1 and 5")
     if not property_ids:
         raise ValueError("property_ids must not be empty")
     if len(property_ids) > 50:
@@ -72,7 +75,20 @@ def multi_property_comparison(
                 )
             return {"property": pid, "total": total, "breakdown": breakdown, "error": None}
         except Exception as e:
-            return {"property": pid, "total": None, "breakdown": None, "error": str(e)[:200]}
+            if hosted:
+                # This helper returns failures as nested data, so the outer
+                # tool exception boundary cannot sanitize them. Only preserve
+                # exact, known credential states; never stringify providers.
+                error = "provider_unavailable"
+                if (
+                    isinstance(e, RuntimeError)
+                    and len(e.args) == 1
+                    and e.args[0] in ("credentials_missing", "credentials_invalid")
+                ):
+                    error = e.args[0]
+            else:
+                error = str(e)[:200]
+            return {"property": pid, "total": None, "breakdown": None, "error": error}
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
         results = list(pool.map(_fetch, norm_ids))

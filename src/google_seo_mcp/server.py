@@ -8,12 +8,260 @@ Tools are namespaced with prefixes to avoid collisions and aid LLM discovery:
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
+import re
 import sys
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+import time
+import uuid
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.tools.base import Tool
+from mcp.server.fastmcp.tools.tool_manager import ToolManager
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import ValidationError
+
+from .consumer_auth import (
+    AuthenticatedConsumer, _HOSTED_AUDIT_MARKER, _audit_tool_names, _hosted_audit_message,
+    consumer_context, emit_hosted_audit, request_id_context,
+)
+from .runtime_config import (
+    ProductionRuntimeConfig,
+    RuntimeConfigurationError,
+    load_runtime_config,
+)
+from .tool_policy import ProductionToolPolicy, ToolPolicyError
+
+_audit_log = logging.getLogger("google_seo_mcp.audit")
+_ORIGINAL_LOGGER_CALL_HANDLERS = logging.Logger.callHandlers
+_hosted_logging_state: dict | None = None
+_hosted_audit_handler: logging.Handler | None = None
+
+
+class _HostedLogFilter(logging.Filter):
+    """Defense in depth for the private sink; input is never formatted here."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _hosted_audit_message(record) is not None
+
+
+def _guarded_call_handlers(self, record: logging.LogRecord) -> None:
+    # Guard the common standard-Python delivery seam, before any library handler
+    # or fallback can format the original record, regardless of propagation.
+    message = _hosted_audit_message(record)
+    handler = _hosted_audit_handler
+    if message is not None and handler is not None:
+        safe_record = logging.LogRecord(
+            "google_seo_mcp.audit", logging.INFO, "", 0, message, (), None,
+        )
+        safe_record.__dict__["_hosted_audit_marker"] = _HOSTED_AUDIT_MARKER
+        handler.handle(safe_record)
+
+
+def _logger_state(logger: logging.Logger) -> tuple:
+    return (logger.handlers[:], logger.level, logger.propagate, logger.disabled, logger.filters[:])
+
+
+def _configure_hosted_logging() -> None:
+    global _hosted_logging_state, _hosted_audit_handler
+    logging._acquireLock()
+    try:
+        if _hosted_logging_state is not None:
+            return
+        loggers = [logging.root] + [
+            logger for logger in logging.root.manager.loggerDict.values()
+            if isinstance(logger, logging.Logger)
+        ]
+        _hosted_logging_state = {
+            "loggers": {logger: _logger_state(logger) for logger in loggers},
+            "lastResort": logging.lastResort,
+        }
+        handler = logging.StreamHandler(sys.stderr)
+        handler.addFilter(_HostedLogFilter())
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _hosted_audit_handler = handler
+        logging.Logger.callHandlers = _guarded_call_handlers
+        logging.lastResort = logging.NullHandler()
+        # Library setup may mutate these later; the delivery guard still holds.
+        for logger in loggers:
+            logger.handlers = []
+            logger.propagate = True
+        logging.root.handlers = [handler]
+        logging.root.setLevel(logging.INFO)
+        google_logger = logging.getLogger("google")
+        google_logger.handlers = [logging.NullHandler()]
+        google_logger.propagate = False
+        for name in ("google_seo_mcp.audit", "google_seo_mcp.consumer_auth"):
+            logger = logging.getLogger(name)
+            logger.setLevel(logging.INFO)
+            logger.disabled = False
+            logger.filters = []
+    finally:
+        logging._releaseLock()
+
+
+def _restore_legacy_logging() -> None:
+    """Restore explicit legacy composition; simultaneous mixed servers unsupported.
+
+    Production owns process logging until this composition boundary. Hosted-only
+    loggers return to defaults; existing handlers remain open for restoration.
+    """
+    global _hosted_logging_state, _hosted_audit_handler
+    logging._acquireLock()
+    try:
+        state = _hosted_logging_state
+        if state is None:
+            return
+        logging.Logger.callHandlers = _ORIGINAL_LOGGER_CALL_HANDLERS
+        logging.lastResort = state["lastResort"]
+        for logger in [logging.root] + [
+            item for item in logging.root.manager.loggerDict.values()
+            if isinstance(item, logging.Logger)
+        ]:
+            saved = state["loggers"].get(logger, ([], logging.NOTSET, True, False, []))
+            logger.handlers, level, logger.propagate, logger.disabled, logger.filters = saved
+            logger.setLevel(level)
+        if _hosted_audit_handler is not None:
+            _hosted_audit_handler.close()
+        _hosted_audit_handler = None
+        _hosted_logging_state = None
+    finally:
+        logging._releaseLock()
+
+
+def _safe_tool_error(exc: Exception) -> str:
+    if isinstance(exc, ToolPolicyError):
+        return "tool_not_allowed"
+    if isinstance(exc, ValidationError):
+        return "invalid_tool_arguments"
+    if (type(exc) is RuntimeError and len(exc.args) == 1
+            and type(exc.args[0]) is str and exc.args[0] in (
+        "credentials_missing", "credentials_invalid", "vendor_unavailable",
+        "google_client_unavailable", "provider_unavailable",
+    )):
+        return exc.args[0]
+    return "provider_unavailable"
+
+
+class HostedTool(Tool):
+    """Own validation, execution and serialization before SDK error rendering."""
+
+    async def run(self, arguments, context=None, convert_result=False):
+        try:
+            result = await self.fn_metadata.call_fn_with_arg_validation(
+                self.fn, self.is_async, arguments,
+                {self.context_kwarg: context} if self.context_kwarg is not None else None,
+            )
+            return self.fn_metadata.convert_result(result) if convert_result else result
+        except Exception as exc:
+            raise ToolError(_safe_tool_error(exc)) from None
+
+
+class PolicyToolManager(ToolManager):
+    """Enforce the same policy at registration, lookup and lowest dispatch seam."""
+
+    def __init__(self, policy: ProductionToolPolicy):
+        # Load the bundled audit names at composition, never on a tool's log
+        # delivery path (which must perform no filesystem or provider access).
+        _audit_tool_names()
+        super().__init__(warn_on_duplicate_tools=False)
+        self.policy = policy
+        self.worker_limiter = anyio.CapacityLimiter(8)
+
+    def add_tool(self, fn, name=None, **kwargs):
+        tool_name = name or fn.__name__
+        self.policy.enforce_tool_call(tool_name)
+        if tool_name in self._tools:
+            raise ToolPolicyError("tool_already_registered")
+
+        @functools.wraps(fn)
+        async def hosted_handler(*args, **arguments):
+            self.policy.enforce_tool_call(tool_name)
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    return await fn(*args, **arguments)
+                # AnyIO copies ContextVars into workers and bounds process-wide
+                # hosted synchronous work. Cancellation waits for worker cleanup.
+                return await anyio.to_thread.run_sync(
+                    functools.partial(fn, *args, **arguments), limiter=self.worker_limiter,
+                )
+            except Exception as exc:
+                raise RuntimeError(_safe_tool_error(exc)) from None
+
+        # Resolving postponed annotations in the original module is essential:
+        # wraps preserves signature text, but the wrapper has different globals.
+        hosted_handler.__signature__ = inspect.signature(fn, eval_str=True)
+        hosted_handler.__annotations__ = inspect.get_annotations(fn, eval_str=True)
+        tool = HostedTool.from_function(hosted_handler, name=tool_name, **kwargs)
+        self._tools[tool_name] = tool
+        return tool
+
+    def get_tool(self, name):
+        self.policy.enforce_tool_call(name)
+        return super().get_tool(name)
+
+    def list_tools(self):
+        return [tool for tool in super().list_tools() if self.policy.is_tool_allowed(tool.name)]
+
+    async def call_tool(self, name, arguments, context=None, convert_result=False):
+        started, outcome = time.monotonic(), "error"
+        safe_name = name if self.policy.is_tool_allowed(name) else "denied"
+        try:
+            self.policy.enforce_tool_call(name, context)
+            tool = self.get_tool(name)
+            if tool is None:
+                raise ToolPolicyError("tool_not_allowed")
+            result = await tool.run(arguments, context=context, convert_result=convert_result)
+            outcome = "success"
+            return result
+        except Exception as exc:
+            outcome = "denied" if isinstance(exc, ToolPolicyError) else "error"
+            # HostedTool already sanitized SDK validation/provider failures.
+            code = str(exc) if type(exc) is ToolError and str(exc) in (
+                "credentials_missing", "credentials_invalid", "vendor_unavailable",
+                "google_client_unavailable", "provider_unavailable", "invalid_tool_arguments",
+                "tool_not_allowed",
+            ) else _safe_tool_error(exc)
+            raise ToolError(code) from None
+        finally:
+            consumer = consumer_context.get()
+            request_id = request_id_context.get()
+            if not isinstance(request_id, str) or re.fullmatch(r"[0-9a-f]{32}", request_id) is None:
+                request_id = uuid.uuid4().hex
+            emit_hosted_audit(_audit_log, {
+                "request_id": request_id,
+                "consumer": (
+                    consumer.consumer_id if isinstance(consumer, AuthenticatedConsumer) else None
+                ),
+                "tool": safe_name, "outcome": outcome,
+                "duration_ms": round((time.monotonic() - started) * 1000, 3),
+            })
+
+
+class ProductionFastMCP(FastMCP):
+    def __init__(self, config: ProductionRuntimeConfig):
+        if not isinstance(config, ProductionRuntimeConfig) or config.profile != "production":
+            raise ToolPolicyError("invalid production configuration")
+        auth_module.configure_hosted_auth(config)
+        _configure_hosted_logging()
+        self.runtime_config = config
+        self.production_policy = ProductionToolPolicy()
+        super().__init__(
+            "google-seo-mcp", host=config.host, port=config.port,
+            stateless_http=True, json_response=True, streamable_http_path="/mcp",
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=list(config.accepted_hosts),
+                allowed_origins=list(config.accepted_origins),
+            ),
+        )
+        self._tool_manager = PolicyToolManager(self.production_policy)
 
 
 def _resolve_mcp_version() -> str:
@@ -118,12 +366,26 @@ from .resources.google_algorithm_updates import algorithm_updates_text
 # tool results. We force every logger (ours and third-party) to stderr,
 # and use ``force=True`` in case a library imported earlier already
 # attached a handler to the root logger.
-logging.basicConfig(
-    level=os.getenv("GOOGLE_SEO_LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    stream=sys.stderr,
-    force=True,
-)
+def _bootstrap_log_level() -> int:
+    # Never pass raw configuration into logging: its ValueError echoes unknown
+    # levels, before main() can apply the sanitized runtime boundary.
+    levels = {
+        "CRITICAL": logging.CRITICAL,
+        "FATAL": logging.FATAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "WARN": logging.WARN,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "NOTSET": logging.NOTSET,
+    }
+    level = levels.get(os.getenv("GOOGLE_SEO_LOG_LEVEL", "INFO"))
+    if level is None:
+        raise RuntimeConfigurationError("invalid runtime configuration") from None
+    return level
+
+
+_BOOTSTRAP_LOG_LEVEL = _bootstrap_log_level()
 
 mcp = FastMCP("google-seo-mcp")
 
@@ -495,8 +757,61 @@ def get_capabilities() -> dict:
     }
 
 
-def main() -> None:
-    mcp.run(transport="stdio")
+# Capture callable definitions once, before any transport selection. A later CLI
+# override rebuilds its own manager and never reuses the legacy 102-tool manager.
+_LEGACY_TOOL_DEFINITIONS = tuple((tool.fn, tool.name) for tool in mcp._tool_manager.list_tools())
+
+# Initial catalog construction is transport-neutral: do not enable SDK debug
+# output before the selected server can install its hosted audit-only filter.
+# Legacy imports and stdio still receive their validated level on stderr.
+logging.basicConfig(
+    level=_BOOTSTRAP_LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
+
+
+def create_server(config: ProductionRuntimeConfig) -> FastMCP:
+    """Create the selected registry without credential construction or refresh.
+
+    HTTP composition calls create_http_app(config, registry, create_server(config)).
+    Independent stdio/HTTP processes are the supported lifecycle; auth identity is
+    process-wide and intentionally shared by all hosted consumers.
+    """
+    if config.profile == "production":
+        instance = ProductionFastMCP(config)
+        for fn, name in _LEGACY_TOOL_DEFINITIONS:
+            if instance.production_policy.is_tool_allowed(name):
+                instance.add_tool(fn, name=name)
+        registered = {tool.name for tool in instance._tool_manager.list_tools()}
+        if registered != instance.production_policy.names:
+            raise ToolPolicyError("production tool registry mismatch")
+    else:
+        _restore_legacy_logging()
+        auth_module.configure_hosted_auth(config)
+        instance = FastMCP("google-seo-mcp")
+        for fn, name in _LEGACY_TOOL_DEFINITIONS:
+            instance.add_tool(fn, name=name)
+    instance.resource("google-seo://algorithm-updates")(google_algorithm_updates_resource)
+    return instance
+
+
+def main(argv: list[str] | None = None) -> None:
+    config = load_runtime_config(argv)
+    instance = create_server(config)
+    if config.transport == "stdio":
+        instance.run(transport="stdio")
+        return
+    import uvicorn
+
+    from .consumer_auth import load_consumer_key_registry
+    from .http_app import create_http_app
+
+    registry = load_consumer_key_registry(config.consumer_keys_file)
+    application = create_http_app(config, registry, instance)
+    uvicorn.run(application, host=config.host, port=config.port,
+                access_log=False, proxy_headers=False, log_config=None)
 
 
 if __name__ == "__main__":

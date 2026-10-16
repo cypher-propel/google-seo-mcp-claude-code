@@ -25,6 +25,7 @@ from typing import Any
 from google.analytics.admin_v1beta import AnalyticsAdminServiceClient
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.auth import default as google_auth_default
+from google.auth.crypt import RSASigner
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -64,6 +65,159 @@ _ga4_admin_client: Any = None
 # this, all tools silently keep returning data from the previous account.
 _credentials_fingerprint: str | None = None
 
+# Set only by the composition root after validating the runtime boundary.  A
+# hosted process never consults the legacy credential cascade or developer HOME.
+_hosted_auth_enabled = False
+_hosted_service_account_file: Path | None = None
+_hosted_credentials: Any = None
+_hosted_credentials_invalid = False
+_hosted_file_fingerprint: tuple[int, ...] | None = None
+_hosted_file_valid = False
+
+
+def is_hosted_production() -> bool:
+    """Also fail closed for direct helper use before composition is complete."""
+    return _hosted_auth_enabled or os.getenv("GOOGLE_SEO_PROFILE", "").lower() == "production"
+
+
+def hosted_auth_enabled() -> bool:
+    """Whether the composition root captured a validated hosted identity."""
+    return _hosted_auth_enabled
+
+
+def configure_hosted_auth(config: Any) -> None:
+    """Select the validated identity without opening files or contacting Google.
+
+    Legacy stdio retains its existing credential resolution.  Reconfiguring a
+    process clears all clients so one identity cannot reuse another's clients.
+    """
+    global _hosted_auth_enabled, _hosted_service_account_file
+    global _hosted_credentials, _hosted_credentials_invalid, _credentials_fingerprint
+    global _hosted_file_fingerprint, _hosted_file_valid
+    global _searchconsole_service, _webmasters_service, _ga4_data_client, _ga4_admin_client
+    with _auth_lock:
+        _hosted_auth_enabled = getattr(config, "profile", None) == "production"
+        sa_file = getattr(config, "service_account_file", None)
+        _hosted_service_account_file = Path(sa_file) if _hosted_auth_enabled and sa_file else None
+        _hosted_credentials = None
+        _hosted_credentials_invalid = False
+        _hosted_file_fingerprint = None
+        _hosted_file_valid = False
+        _credentials_fingerprint = None
+        _searchconsole_service = _webmasters_service = None
+        _ga4_data_client = _ga4_admin_client = None
+
+
+def google_credentials_state() -> str:
+    """Offline file/schema availability; never an assertion of Google access.
+
+    Only the configured service-account file is inspected.  No credential
+    constructor, token refresh, ADC lookup or OAuth cache creation occurs here.
+    """
+    if not is_hosted_production() or _hosted_service_account_file is None:
+        return "pending"
+    try:
+        _validate_hosted_service_account_file()
+    except FileNotFoundError:
+        return "pending"
+    except Exception:
+        return "invalid"
+    return "invalid" if _hosted_credentials_invalid else "available"
+
+
+def _validate_hosted_service_account_file() -> None:
+    """Cache only validation status, never parsed JSON or signing material."""
+    global _hosted_file_fingerprint, _hosted_file_valid
+    if _hosted_service_account_file is None:
+        raise FileNotFoundError
+    stat = _hosted_service_account_file.stat()
+    fingerprint = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    if fingerprint == _hosted_file_fingerprint:
+        if not _hosted_file_valid:
+            raise ValueError("invalid service-account file")
+        return
+    try:
+        _read_hosted_service_account_info()
+    except Exception:
+        _hosted_file_fingerprint, _hosted_file_valid = fingerprint, False
+        raise
+    _hosted_file_fingerprint, _hosted_file_valid = fingerprint, True
+
+
+def _read_hosted_service_account_info() -> dict[str, Any]:
+    """Bounded local validation, including fixed credential refresh destination.
+
+    This intentionally does not construct Google credentials or validate grants.
+    The caller sanitizes every parse/I/O error before it crosses the boundary.
+    """
+    if _hosted_service_account_file is None:
+        raise FileNotFoundError
+    if not _hosted_service_account_file.is_file():
+        if not _hosted_service_account_file.exists():
+            raise FileNotFoundError
+        raise ValueError("invalid service-account file")
+    with _hosted_service_account_file.open("rb") as source:
+        raw = source.read(131073)
+    if len(raw) > 131072:
+        raise ValueError("invalid service-account file")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate service-account field")
+            result[key] = value
+        return result
+
+    info = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(info, dict) or info.get("type") != "service_account":
+        raise ValueError("invalid service-account schema")
+    email = info.get("client_email")
+    key = info.get("private_key")
+    if (
+        not isinstance(email, str)
+        or not email.isascii()
+        or not 3 <= len(email) <= 320
+        or "@" not in email
+        or any(c.isspace() for c in email)
+    ):
+        raise ValueError("invalid service-account schema")
+    if (
+        not isinstance(key, str)
+        or not key.startswith("-----BEGIN PRIVATE KEY-----\n")
+        or not key.rstrip().endswith("-----END PRIVATE KEY-----")
+    ):
+        raise ValueError("invalid service-account schema")
+    if info.get("token_uri") != "https://oauth2.googleapis.com/token":
+        raise ValueError("invalid service-account token destination")
+    if info.get("universe_domain", "googleapis.com") != "googleapis.com":
+        raise ValueError("invalid service-account API destination")
+    # Local PEM parsing only: this creates no Google credential/client, token,
+    # refresh transport or network request.  Required-credential readiness must
+    # reject broken signing data even before a business tool is called.
+    RSASigner.from_string(key)
+    return info
+
+
+def _build_hosted_creds() -> Any:
+    global _hosted_credentials, _hosted_credentials_invalid
+    if _hosted_credentials is not None:
+        return _hosted_credentials
+    if _hosted_service_account_file is None:
+        raise RuntimeError("credentials_missing")
+    try:
+        _validate_hosted_service_account_file()
+        _hosted_credentials = SACredentials.from_service_account_file(
+            str(_hosted_service_account_file), scopes=list(SCOPES_READ)
+        )
+    except FileNotFoundError:
+        raise RuntimeError("credentials_missing") from None
+    except Exception:
+        _hosted_credentials_invalid = True
+        raise RuntimeError("credentials_invalid") from None
+    _hosted_credentials_invalid = False
+    return _hosted_credentials
+
 
 def _current_credentials_fingerprint() -> str:
     """Hash of the ENV vars + file mtimes that determine which identity wins.
@@ -73,6 +227,17 @@ def _current_credentials_fingerprint() -> str:
     discarded and built afresh — preventing silent multi-tenant bleed when
     the operator swaps accounts mid-session.
     """
+    if is_hosted_production():
+        if _hosted_service_account_file is None:
+            return "hosted:pending"
+        try:
+            stat = _hosted_service_account_file.stat()
+            version = (
+                f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_size}"
+            )
+        except OSError:
+            version = "missing"
+        return f"hosted:{_hosted_service_account_file}:{version}"
     parts: list[str] = [
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
         os.getenv("GOOGLE_SEO_SERVICE_ACCOUNT_FILE", ""),
@@ -110,10 +275,13 @@ def _check_fingerprint_or_invalidate() -> None:
             "Discarding cached clients."
         )
         global _searchconsole_service, _webmasters_service, _ga4_data_client, _ga4_admin_client
+        global _hosted_credentials, _hosted_credentials_invalid
         _searchconsole_service = None
         _webmasters_service = None
         _ga4_data_client = None
         _ga4_admin_client = None
+        _hosted_credentials = None
+        _hosted_credentials_invalid = False
         _credentials_fingerprint = fp
 
 
@@ -124,6 +292,8 @@ def _config_dir() -> Path:
 
 
 def _scopes() -> list[str]:
+    if is_hosted_production():
+        return list(SCOPES_READ)
     return SCOPES_WRITE if os.getenv("GSC_ALLOW_DESTRUCTIVE") == "true" else SCOPES_READ
 
 
@@ -266,6 +436,8 @@ def _atomic_write_text(target: Path, text: str) -> None:
 
 
 def _build_creds() -> Any:
+    if is_hosted_production():
+        return _build_hosted_creds()
     creds = _from_adc() or _from_service_account() or _from_oauth_flow()
     if creds is None:
         raise RuntimeError(
@@ -291,31 +463,49 @@ def _build_creds() -> Any:
 
 # ── GSC clients ─────────────────────────────────────────────────────────────
 
+def _hosted_client(factory: Any, *args: Any, **kwargs: Any) -> Any:
+    """Do not surface constructor/credential exception values to callers."""
+    creds = _build_creds()
+    try:
+        return factory(*args, credentials=creds, **kwargs)
+    except Exception:
+        raise RuntimeError("google_client_unavailable") from None
+
 def get_searchconsole():
     """Search Console v1 client (URL Inspection API lives here)."""
     global _searchconsole_service
-    if _searchconsole_service is not None:
+    if _searchconsole_service is not None and not is_hosted_production():
         return _searchconsole_service
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _searchconsole_service is None:
-            _searchconsole_service = build(
-                "searchconsole", "v1", credentials=_build_creds(), cache_discovery=False
-            )
+            if is_hosted_production():
+                _searchconsole_service = _hosted_client(
+                    build, "searchconsole", "v1", cache_discovery=False, static_discovery=True
+                )
+            else:
+                _searchconsole_service = build(
+                    "searchconsole", "v1", credentials=_build_creds(), cache_discovery=False
+                )
     return _searchconsole_service
 
 
 def get_webmasters():
     """Webmasters v3 client (Search Analytics, sitemaps, sites)."""
     global _webmasters_service
-    if _webmasters_service is not None:
+    if _webmasters_service is not None and not is_hosted_production():
         return _webmasters_service
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _webmasters_service is None:
-            _webmasters_service = build(
-                "webmasters", "v3", credentials=_build_creds(), cache_discovery=False
-            )
+            if is_hosted_production():
+                _webmasters_service = _hosted_client(
+                    build, "webmasters", "v3", cache_discovery=False, static_discovery=True
+                )
+            else:
+                _webmasters_service = build(
+                    "webmasters", "v3", credentials=_build_creds(), cache_discovery=False
+                )
     return _webmasters_service
 
 
@@ -324,24 +514,30 @@ def get_webmasters():
 def get_data_client() -> BetaAnalyticsDataClient:
     """GA4 Data API v1beta client (runReport, runRealtimeReport, etc.)."""
     global _ga4_data_client
-    if _ga4_data_client is not None:
+    if _ga4_data_client is not None and not is_hosted_production():
         return _ga4_data_client
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _ga4_data_client is None:
-            _ga4_data_client = BetaAnalyticsDataClient(credentials=_build_creds())
+            _ga4_data_client = (
+                _hosted_client(BetaAnalyticsDataClient) if is_hosted_production()
+                else BetaAnalyticsDataClient(credentials=_build_creds())
+            )
     return _ga4_data_client
 
 
 def get_admin_client() -> AnalyticsAdminServiceClient:
     """GA4 Admin API v1beta client (accounts, properties, custom dims)."""
     global _ga4_admin_client
-    if _ga4_admin_client is not None:
+    if _ga4_admin_client is not None and not is_hosted_production():
         return _ga4_admin_client
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _ga4_admin_client is None:
-            _ga4_admin_client = AnalyticsAdminServiceClient(credentials=_build_creds())
+            _ga4_admin_client = (
+                _hosted_client(AnalyticsAdminServiceClient) if is_hosted_production()
+                else AnalyticsAdminServiceClient(credentials=_build_creds())
+            )
     return _ga4_admin_client
 
 
@@ -357,6 +553,8 @@ def current_credential_type() -> str:
 
     Returns one of: 'service_account', 'adc', 'oauth_flow', 'none'.
     """
+    if is_hosted_production():
+        return "service_account" if google_credentials_state() == "available" else "none"
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and Path(
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
     ).exists():
@@ -388,11 +586,22 @@ def reset_clients(*, drop_oauth_token: bool = True) -> dict:
     surface to the agent.
     """
     global _searchconsole_service, _webmasters_service, _ga4_data_client, _ga4_admin_client
+    global _hosted_credentials, _hosted_credentials_invalid, _credentials_fingerprint
     with _auth_lock:
         _searchconsole_service = None
         _webmasters_service = None
         _ga4_data_client = None
         _ga4_admin_client = None
+        _hosted_credentials = None
+        _hosted_credentials_invalid = False
+        _credentials_fingerprint = None
+
+    if is_hosted_production():
+        return {
+            "credential_type": current_credential_type(),
+            "deleted_oauth_token": False,
+            "message": "In-process clients reset; hosted service-account identity retained.",
+        }
 
     cred_type = current_credential_type()
     deleted_token = False

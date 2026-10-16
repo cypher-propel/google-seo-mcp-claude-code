@@ -1,0 +1,44 @@
+# Build-context allowlist: private ADW/history, Git, environments, docs, tests,
+# logs, node_modules, sockets and deployment secrets are excluded by default.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!requirements-production.lock
+!README.md
+!LICENSE
+!src/
+!src/**
+
+# Also refuse generated or private files accidentally placed beneath src/.
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.git
+**/.agents
+**/.venv
+**/venv
+**/node_modules
+**/.env
+**/.env.*
+**/*.env
+**/.ssh
+**/.config
+**/.cache
+**/credentials
+**/secrets
+**/*credentials*.json
+**/*service*account*.json
+**/client_secret*.json
+**/consumer-keys*.json
+**/consumers.json
+**/token.json
+**/.token.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.log
+**/*.sock
+**/*.sqlite*
+**/*.db
