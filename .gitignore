@@ -27,3 +27,14 @@ gsc-reports/
 
 # Personal notes — never commit
 ULTIMACONVERSACION.md
+
+# Isolated baseline and local ADW runtime
+/.agents/
+node_modules/
+.agents/data/*-shm
+.agents/data/*-wal
+.baseline-home/
+.audit-venv/
+
+# Runtime dependency symlink
+/node_modules
