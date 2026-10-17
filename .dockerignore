@@ -9,6 +9,9 @@
 !LICENSE
 !src/
 !src/**
+!deploy/
+!deploy/image-build/
+!deploy/image-build/google_seo_mcp-0.8.5-py3-none-any.whl
 
 # Also refuse generated or private files accidentally placed beneath src/.
 **/__pycache__

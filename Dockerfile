@@ -24,23 +24,22 @@ COPY requirements-production.lock ./
 # tools above. Build isolation must not resolve unpinned backend dependencies.
 RUN python -m pip wheel --index-url https://pypi.org/simple \
       --require-hashes --no-build-isolation --no-deps \
-      --wheel-dir /wheelhouse -r requirements-production.lock \
-    && sed -n '1p' /tmp/build-tools.lock > /tmp/bootstrap-pip.lock \
-    && python -m pip download --index-url https://pypi.org/simple \
-      --require-hashes --no-deps --only-binary=:all: \
-      --dest /wheelhouse -r /tmp/bootstrap-pip.lock
+      --wheel-dir /wheelhouse -r requirements-production.lock
 
-COPY pyproject.toml README.md LICENSE ./
+# Install the exact qualified archive, never regenerate an application wheel.
+# Compare all package/data members with this build context to reject stale input.
+COPY deploy/image-build/google_seo_mcp-0.8.5-py3-none-any.whl ./
 COPY src/ ./src/
-RUN python -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . \
-    && python -c 'from pathlib import Path; import zipfile; wheels=list(Path("/wheelhouse").glob("google_seo_mcp-*.whl")); assert len(wheels)==1; assert "google_seo_mcp/production_tools.json" in zipfile.ZipFile(wheels[0]).namelist()' \
-    && python -c 'from pathlib import Path; import hashlib; wheels=sorted(Path("/wheelhouse").glob("*.whl")); Path("/wheelhouse/runtime-wheels.lock").write_text("".join(str(p)+" --hash=sha256:"+hashlib.sha256(p.read_bytes()).hexdigest()+"\n" for p in wheels))' \
+RUN python -c 'from pathlib import Path; import hashlib,zipfile; p=Path("google_seo_mcp-0.8.5-py3-none-any.whl"); assert hashlib.sha256(p.read_bytes()).hexdigest()=="5570f99a4ded33125e23ca30d14dcec189520f48b79816e48999438bc4c81ffa", "Unqualified application archive"; z=zipfile.ZipFile(p); members={n:z.read(n) for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")}; source={p.relative_to("src").as_posix():p.read_bytes() for p in Path("src/google_seo_mcp").rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix not in {".pyc",".pyo"}}; assert len(z.namelist())==83 and len(members)==77; assert members==source, "Qualified archive differs from source/data"' \
     && python -m venv --without-pip /opt/venv \
+    && mkdir -p /opt/venv/share/qualified-application \
+    && cp google_seo_mcp-0.8.5-py3-none-any.whl /opt/venv/share/qualified-application/ \
+    && python -c 'from pathlib import Path; import hashlib; wheels=sorted(Path("/wheelhouse").glob("*.whl")); assert len(wheels)==74 and not any(p.name.lower().startswith("pip-") for p in wheels); wheels.append(Path("/opt/venv/share/qualified-application/google_seo_mcp-0.8.5-py3-none-any.whl")); Path("/wheelhouse/runtime-wheels.lock").write_text("".join(str(p)+" --hash=sha256:"+hashlib.sha256(p.read_bytes()).hexdigest()+"\n" for p in wheels))' \
     && python -m pip --python /opt/venv/bin/python install \
       --no-index --no-deps --require-hashes -r /wheelhouse/runtime-wheels.lock \
-    && /opt/venv/bin/python -m pip check \
-    && /opt/venv/bin/python -c 'from importlib.metadata import distributions; names={d.metadata["Name"].lower().replace("_","-") for d in distributions()}; assert not names.intersection({"advertools","scrapy","twisted","setuptools","wheel","packaging","build","pip-tools","pip-audit","pytest","ruff","playwright","scipy","statsmodels"})' \
-    && mkdir -p /opt/venv/share \
+    && python -m pip --python /opt/venv/bin/python check \
+    && /opt/venv/bin/python -c 'from importlib.metadata import distributions; from importlib.util import find_spec; from pathlib import Path; names={d.metadata["Name"].lower().replace("_","-") for d in distributions()}; assert len(names)==75; assert find_spec("pip") is None; assert not list(Path("/opt/venv/bin").glob("pip*")); assert not names.intersection({"pip","advertools","scrapy","twisted","setuptools","wheel","packaging","build","pip-tools","pip-audit","pytest","ruff","playwright","scipy","statsmodels"})' \
+    && /opt/venv/bin/python -c 'from pathlib import Path; import sysconfig,zipfile; z=zipfile.ZipFile("/opt/venv/share/qualified-application/google_seo_mcp-0.8.5-py3-none-any.whl"); root=Path(sysconfig.get_path("purelib")); members=[n for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")]; assert len(members)==77; assert all((root/n).read_bytes()==z.read(n) for n in members), "Installed application differs from qualified archive"' \
     && cp /wheelhouse/runtime-wheels.lock /opt/venv/share/runtime-wheels.lock
 
 FROM python:3.11-slim-bookworm@sha256:8a00ecb83ed9d0864dfd102a1bdb2067fda907ceb30bb86d09da9ee558b19590 AS runtime
@@ -52,14 +51,18 @@ LABEL org.opencontainers.image.source="https://github.com/cypher-propel/google-s
       org.opencontainers.image.base.name="docker.io/library/python:3.11-slim-bookworm" \
       org.opencontainers.image.base.digest="sha256:8a00ecb83ed9d0864dfd102a1bdb2067fda907ceb30bb86d09da9ee558b19590"
 
-# Remove the base's bootstrap tooling. Only the separately audited, pinned pip
-# in /opt/venv remains for exact final-runtime pip check/freeze/inspect evidence.
+# Remove global tooling and ensurepip, including its bundled bootstrap wheels.
+# Dependency checking uses builder-only external pip; runtime has no installer.
 RUN python -c 'import os,re; assert re.fullmatch(r"unknown|[a-f0-9]{40}",os.environ["GOOGLE_SEO_REVISION"]), "Invalid release revision"' \
     && python -m pip uninstall --yes pip setuptools wheel packaging \
-    && python -c 'from importlib.metadata import distributions; names=[d.metadata["Name"] for d in distributions()]; assert not names, "Unexpected global Python distributions: "+repr(names)' \
+    && python -c 'from pathlib import Path; import shutil,sysconfig; shutil.rmtree(Path(sysconfig.get_path("stdlib"))/"ensurepip")' \
+    && python -c 'from importlib.metadata import distributions; from importlib.util import find_spec; names=[d.metadata["Name"] for d in distributions()]; assert not names, "Unexpected global Python distributions: "+repr(names); assert all(find_spec(n) is None for n in ("pip","ensurepip","setuptools","wheel","packaging"))' \
     && mkdir -p /app \
     && chmod 0555 /app
 COPY --from=wheel-builder /opt/venv /opt/venv
+# Fail closed on residual installer modules, distributions, scripts or archives.
+RUN /opt/venv/bin/python -c 'from importlib.util import find_spec; from importlib.metadata import distributions; assert find_spec("pip") is None and find_spec("ensurepip") is None; names={d.metadata["Name"].lower().replace("_","-") for d in distributions()}; assert len(names)==75 and not names.intersection({"pip","setuptools","wheel","packaging"})' \
+    && python -c 'from pathlib import Path; import re; roots=(Path("/usr/local"),Path("/opt/venv")); residual=[str(p) for root in roots for p in root.rglob("*") if re.fullmatch(r"(?:ensurepip|pip)(?:[0-9].*|[-_.].*)?",p.name,re.I) or p.name=="__pip-runner__.py"]; assert not residual, "Residual installer artifacts: "+repr(residual)'
 
 ENV PATH=/opt/venv/bin:$PATH \
     HOME=/tmp \
