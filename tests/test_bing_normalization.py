@@ -153,6 +153,12 @@ def test_raw_positions_never_scaled():
     "field", ["Clicks", "Impressions", "AvgClickPosition", "AvgImpressionPosition"]
 )
 def test_strict_finite_nonnegative_metrics(value, field):
+    # Raw Int32 positions are signed; only count metrics are nonnegative.
+    if field in {"AvgClickPosition", "AvgImpressionPosition"} and type(value) is int and value < 0:
+        row = RawBingQueryStats(**{**QUERY, field: value})
+        name = "avg_click_position" if field == "AvgClickPosition" else "avg_impression_position"
+        assert row.model_dump()[name] == value
+        return
     with pytest.raises(ValidationError):
         RawBingQueryStats(**{**QUERY, field: value})
 
