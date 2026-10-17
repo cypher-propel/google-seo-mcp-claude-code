@@ -53,8 +53,21 @@ def runtime_cleanup_guard():
     assert uninstall[4] == "--yes"
     assert set(uninstall[5:]) == BOOTSTRAP_PACKAGES, "remove all four global packages"
     assert len(uninstall[5:]) == len(BOOTSTRAP_PACKAGES)
-    assert command_index + 1 < len(commands), "chain the guard immediately after uninstall"
-    guard = commands[command_index + 1]
+    assert all(not (set(token) <= set(";&|"))
+               for command in commands for token in command), "use only success-only chaining"
+    assert command_index + 2 < len(commands), "chain removal and guard immediately after uninstall"
+    removal = commands[command_index + 1]
+    assert len(removal) == 3 and removal[:2] == ["python", "-c"], (
+        "remove ensurepip with global Python"
+    )
+    expected_removal = ast.parse(
+        'from pathlib import Path; import shutil,sysconfig; '
+        'shutil.rmtree(Path(sysconfig.get_path("stdlib"))/"ensurepip")'
+    )
+    assert ast.dump(ast.parse(removal[2])) == ast.dump(expected_removal), (
+        "require exactly the accepted stdlib ensurepip removal"
+    )
+    guard = commands[command_index + 2]
     assert len(guard) == 3 and guard[:2] == ["python", "-c"], "use global Python"
     tree = ast.parse(guard[2])
     assert any(isinstance(node, ast.ImportFrom) and node.module == "importlib.metadata"
@@ -62,7 +75,7 @@ def runtime_cleanup_guard():
     assert any(isinstance(node, ast.Assert) for node in ast.walk(tree)), "require an assertion"
     before_guard = "\n".join(argument for _, argument in instructions[:index])
     before_guard += "\n" + "\n".join(" ".join(command)
-                                        for command in commands[:command_index + 1])
+                                        for command in commands[:command_index + 2])
     assert "/opt/venv" not in before_guard, "cleanup must precede venv selection or COPY"
     assert "PYTHONOPTIMIZE" not in before_guard, "the assertion must remain enabled"
     after_guard = instructions[index + 1:]
