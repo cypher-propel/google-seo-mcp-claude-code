@@ -16,6 +16,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from . import auth
+from .bing.auth import bing_credentials_state
 from .consumer_auth import ConsumerKeyEdgeMiddleware, ConsumerKeyRegistry
 from .runtime_config import ProductionRuntimeConfig
 from .tool_policy import ProductionToolPolicy
@@ -28,6 +29,7 @@ class HealthStatus(BaseModel):
     status: Literal["not-ready", "credential-pending", "credentials-invalid", "transport-ready"]
     transport_ready: bool
     google_credentials_state: Literal["pending", "invalid", "available"]
+    bing_credentials_state: Literal["pending", "invalid", "available"]
     revision: str
 
 
@@ -96,18 +98,26 @@ def create_http_app(
         return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
 
     async def readyz(request: Request) -> JSONResponse:
-        # This only validates the configured local file/schema. It never
-        # constructs credentials, refreshes a token, or verifies Google access.
+        # Both states inspect bounded local custody only, never provider grants.
         state = auth.google_credentials_state()
+        bing_state = bing_credentials_state()
         status = (
             "not-ready" if not transport_ready else
             "credential-pending" if state == "pending" else
-            "credentials-invalid" if state == "invalid" else "transport-ready"
+            "credentials-invalid" if state == "invalid" else
+            "credential-pending" if config.require_bing_credentials and bing_state == "pending" else
+            "credentials-invalid" if (
+                config.require_bing_credentials and bing_state == "invalid"
+            ) else "transport-ready"
         )
-        ready = transport_ready and (not config.require_google_credentials or state == "available")
+        ready = (
+            transport_ready
+            and (not config.require_google_credentials or state == "available")
+            and (not config.require_bing_credentials or bing_state == "available")
+        )
         health = HealthStatus(
             status=status, transport_ready=transport_ready,
-            google_credentials_state=state, revision=revision,
+            google_credentials_state=state, bing_credentials_state=bing_state, revision=revision,
         )
         return JSONResponse(
             health.model_dump(), status_code=200 if ready else 503,

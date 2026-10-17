@@ -28,6 +28,23 @@ from mcp.client.streamable_http import streamable_http_client  # noqa: F401
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = json.loads((ROOT / "src/google_seo_mcp/production_tools.json").read_text())
+# Independent golden; never infer accepted names from the manifest or discovery.
+EXPECTED_TOOLS = frozenset({
+    "cross_gsc_to_ga4_journey", "cross_landing_page_full_diagnosis",
+    "cross_multi_property_comparison", "cross_opportunity_matrix",
+    "cross_seo_to_revenue_attribution", "cross_traffic_health_check",
+    "ga4_anomalies", "ga4_channel_attribution", "ga4_cohort_retention",
+    "ga4_content_decay", "ga4_conversion_funnel", "ga4_estimate_query_size",
+    "ga4_event_volume_comparison", "ga4_get_property_details", "ga4_landing_page_health",
+    "ga4_list_properties", "ga4_list_schema_categories", "ga4_query", "ga4_search_schema",
+    "ga4_traffic_drops_by_channel", "gsc_alerts", "gsc_cannibalization", "gsc_content_decay",
+    "gsc_ctr_opportunities", "gsc_inspect_url", "gsc_list_sitemaps", "gsc_list_sites",
+    "gsc_quick_wins", "gsc_search_analytics", "gsc_site_snapshot", "gsc_traffic_drops",
+    "serp_aio_monitor", "serp_check", "serp_competitor_intersect", "serp_paa_extractor",
+    "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats", "bing_page_stats",
+    "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
+    "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
+})
 PUBLIC = "https://google-seo.mcp.propel.marketing/mcp"
 MOCK_TOKEN = "synthetic-operator-test-not-a-consumer-secret"
 SENTINEL = "MOCK_UPSTREAM_EXCEPTION_MUST_NOT_ESCAPE"
@@ -151,12 +168,14 @@ def assert_failure_leaves(error, expected_type):
 
 
 def test_smoke_real_sdk_exhausts_pages_without_business_calls(smoke_module, monkeypatch):
-    names = MANIFEST["tools"]
+    assert {"version": 1, "tools": sorted(EXPECTED_TOOLS)} == MANIFEST
+    assert len(EXPECTED_TOOLS) == 46
+    names = sorted(EXPECTED_TOOLS)
     pages = {None: (names[:11], "page-2"), "page-2": (names[11:25], "page-3"),
              "page-3": (names[25:], None)}
     observed, clients = install_mock_mcp(monkeypatch, pages)
     result = asyncio.run(smoke_module.smoke(smoke_options()))
-    assert result == {"status": "PASS", "catalog_count": 35, "revision": "unavailable"}
+    assert result == {"status": "PASS", "catalog_count": 46, "revision": "unavailable"}
     assert_discovery_only(observed)
     assert [body.get("params", {}).get("cursor") for _, body in observed
             if body and body.get("method") == "tools/list"] == [None, "page-2", "page-3"]
@@ -174,7 +193,7 @@ def test_smoke_real_sdk_exhausts_pages_without_business_calls(smoke_module, monk
 
 @pytest.mark.parametrize("catalog_case", ["duplicate", "missing", "unknown", "cycle", "endless"])
 def test_smoke_real_sdk_refuses_bad_catalog(smoke_module, monkeypatch, catalog_case):
-    names = list(MANIFEST["tools"])
+    names = sorted(EXPECTED_TOOLS)
     if catalog_case == "duplicate":
         names[-1] = names[0]
     elif catalog_case == "missing":
@@ -185,7 +204,7 @@ def test_smoke_real_sdk_refuses_bad_catalog(smoke_module, monkeypatch, catalog_c
         pages = {None: ([], "again"), "again": ([], "again")}
     elif catalog_case == "endless":
         pages = {None: ([], "0")}
-        pages.update({str(i): ([], str(i + 1)) for i in range(36)})
+        pages.update({str(i): ([], str(i + 1)) for i in range(46)})
     else:
         pages = {None: (names, None)}
     observed, _ = install_mock_mcp(monkeypatch, pages)
@@ -193,7 +212,12 @@ def test_smoke_real_sdk_refuses_bad_catalog(smoke_module, monkeypatch, catalog_c
         asyncio.run(smoke_module.smoke(smoke_options()))
     assert_failure_leaves(caught.value, smoke_module.SmokeFailure)
     assert_discovery_only(observed)
-    assert len(observed) <= 40
+    assert len(observed) <= 51
+    if catalog_case == "endless":
+        cursors = [body.get("params", {}).get("cursor") for _, body in observed
+                   if body and body.get("method") == "tools/list"]
+        assert cursors == [None] + [str(i) for i in range(46)]
+        assert len(observed) == 51  # 47 pages + anonymous/health/initialize/notification.
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -399,7 +423,8 @@ def test_audit_coherent_mock_fixture_retains_evidence(
 ):
     code, summary, output = invoke_audit(audit_module, tmp_path, capsys, mode)
     assert code == 0
-    assert summary["runtime_distributions"] == 76 and summary["manifest_tools"] == 35
+    assert {"version": 1, "tools": sorted(EXPECTED_TOOLS)} == MANIFEST
+    assert summary["runtime_distributions"] == 76 and summary["manifest_tools"] == 46
     assert summary["twisted_chain"] == "absent"
     assert summary["python_audit"]["distributions"] == 75
     assert summary["python_audit"]["findings"] == 0  # MOCK fixture, not a real scan result.

@@ -1,6 +1,17 @@
 {
   "version": 1,
   "tools": [
+    "bing_crawl_issues",
+    "bing_crawl_stats",
+    "bing_list_sitemaps",
+    "bing_list_sites",
+    "bing_page_query_stats",
+    "bing_page_stats",
+    "bing_query_page_stats",
+    "bing_query_stats",
+    "bing_rank_traffic_stats",
+    "bing_sitemap_details",
+    "bing_url_info",
     "cross_gsc_to_ga4_journey",
     "cross_landing_page_full_diagnosis",
     "cross_multi_property_comparison",

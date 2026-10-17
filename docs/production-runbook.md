@@ -10,16 +10,17 @@ record, expanded Compose output or image.
 
 ## Runtime contract
 
-`google-seo-mcp` defaults to legacy stdio, with the historical 102-tool catalog
+`google-seo-mcp` defaults to legacy stdio, with the 113-tool catalog
 and protocol-only stdout. `--transport streamable-http` selects the restricted
 production profile: SDK 1 FastMCP, stateless JSON HTTP, one worker/replica,
 `/mcp` and `/mcp/`. There are no legacy `/sse` or `/messages` endpoints. CLI
 transport/host/port options override their environment settings.
 
-The exact hosted catalog is the 35 names in the packaged
-[`production_tools.json`](../src/google_seo_mcp/production_tools.json): existing
-GSC/GA4/cross-platform reads except sitemap submission, plus `serp_check`,
-`serp_aio_monitor`, `serp_paa_extractor` and `serp_competitor_intersect`.
+The exact hosted catalog is the 46 names in the packaged
+[`production_tools.json`](../src/google_seo_mcp/production_tools.json): the unchanged
+35 GSC/GA4/cross-platform/SERP reads (including `serp_check`, `serp_aio_monitor`,
+`serp_paa_extractor` and `serp_competitor_intersect`) plus exactly the eleven
+isolated Bing reads below. Catalog presence does not certify live Bing readiness.
 Registration and direct dispatch both enforce the manifest. Arbitrary fetch,
 crawl/browser, local file, logs/history, metadata/credential reload, Google
 Indexing, sitemap writes and IndexNow are excluded. Future names require review
@@ -116,9 +117,10 @@ digests using constant-time digest comparison.
 Keep the directory operator-owned and restricted, with traversal and file-read
 permissions only for the operator/service group used by UID/GID 10001 (for
 example directory 0750 and files 0640 with the correct group). Verify permissions
-and presence without reading contents into output. The application does not
-enforce host ownership/mode for you. Rotation uses atomic registry replacement
-and recreation of only this service; the in-memory registry does not hot-reload.
+and presence without reading contents into output. These registry/Google
+instructions do not replace Bing's enforced custody checks below. Rotation uses
+atomic registry replacement and recreation of only this service; the in-memory
+registry does not hot-reload.
 Verify revoked-key denial and new-key acceptance after recreation using approved
 injection. Preserve revocations through code rollback. Any overlap needs approval.
 
@@ -149,6 +151,210 @@ missing, null, malformed or errored observations yield sanitized
 `vendor_unavailable`. Batch results count only qualified observations and retain
 explicit per-item errors. Inspect those payload errors before interpreting a
 negative finding or a completed call as a provider result.
+
+## Optional Bing Webmaster provider — Step 5.4
+
+This section governs the additive Bing release on the existing Google service;
+it is not a claim that any gate has run. Historical initial-route/Google-enrollment
+procedures later in this document do not authorize redoing those operations.
+Preserve the existing Google credentials, grants, DataForSEO injection, consumer
+registry, ingress/auth design and all Compose hardening/resources.
+
+### Exact path-only configuration and readiness
+
+Only these three Bing runtime fields/environment names are supported:
+
+| Runtime field | Environment name | Default |
+| --- | --- | --- |
+| `bing_credentials_file` | `GOOGLE_SEO_BING_CREDENTIALS_FILE` | `/run/secrets/bing-webmaster.json` |
+| `bing_sites_file` | `GOOGLE_SEO_BING_SITES_FILE` | `/run/secrets/bing-sites.json` |
+| `require_bing_credentials` | `GOOGLE_SEO_REQUIRE_BING_CREDENTIALS` | `false` |
+
+Compose fixes the two container paths, like its Google/registry paths; the env
+example documents them for direct processes, not Compose path overrides. Only
+its Bing-required boolean is forwarded. There is no fourth field, API-key env
+fallback, HOME lookup, OAuth/browser/Google credential fallback, caller key/path,
+account selector or configurable upstream endpoint. Keep required mode **false**
+through credential-pending deployment and until the later separately authorized
+grant/provider qualification; switching it is not a grant check.
+
+Reuse the existing protected directory bind at `/run/secrets`, read-only with
+`create_host_path:false`. No additional mount, individual-file placeholder,
+service or secret materializer is introduced. Bing files remain absent until the
+HOLD/resume gate below. The template's `/etc/propel-mcp/google-seo` source directory
+is a documented example, **not a verified live path**. The parent operator must
+inspect the approved deployed layout, mirror the existing DataForSEO deployment
+custody pattern outside Git, and reconcile its actual protected directory/mount
+before any later wiring. Do not invent an actual host path or move existing files
+to match the example.
+
+Local `/readyz` adds only `bing_credentials_state`:
+
+- `pending`: either document absent, unless a present document is invalid.
+- `invalid`: malformed/unreadable/unprotected key or policy, policy mismatch, or
+  observed custody/fingerprint change. Present invalid takes precedence over absence.
+- `available`: both bounded documents pass local schema/custody, **not** current
+  Bing grants, verification, token validity, API access or business usefulness.
+
+With optional Bing, all existing Google readiness/status decisions are unchanged:
+healthy Google remains ready when Bing is missing or invalid. Required Bing makes
+pending/invalid return 503, subject also to the independent Google/transport gate.
+`/healthz` stays minimal HTTP200. Probes never contact Bing. Missing configuration
+returns explicit `unavailable` / `provider_not_configured` before DNS/client
+construction; invalid files fail closed, never empty business success. Catalog
+listing and successful HTTP dispatch are not provider qualification.
+
+### Operator custody and exact approved site policy
+
+The operator enrolls the **EXISTING** Bing Webmaster key in Infisical project
+`cypher`, environment `prod`, named `BING_WEBMASTER_API_KEY`. Do not generate,
+delete or regenerate a key: it is user-wide and may serve other integrations.
+This is a vault name, not a runtime env-key contract. Agents/consumers never
+receive the value. No secret value belongs in Git, Compose, `.env`, image layers,
+CLI arguments, logs, transcripts, task records or qualification artifacts.
+
+Only after the resume gate may the approved injector materialize a strict JSON
+credential document: exactly `version` (integer `1`) and `api_key` (bounded,
+nonempty string; no control characters), maximum **16 KiB** file size. Do not
+paste a literal key or a placeholder credential document into this runbook.
+The separate **nonsecret** policy file is maximum **64 KiB** and must contain
+exactly this singleton, with no aliases, alternate host/scheme, implicit default
+or additional sites:
+
+```json
+{"version":1,"sites":["https://kelleyconstructioninc.com/"]}
+```
+
+Both documents reject unknown fields, duplicate JSON keys and invalid schemas.
+Protect the nonsecret policy exactly like the credential: static admission is an
+authorization boundary, not proof of provider-side grants or tenant isolation.
+All consumers share one Bing identity and this approved site; bearer keys provide
+authentication/attribution only. Discovery returns approved verified observations
+without verification codes. Business reads enforce the static policy and rely
+on Bing to enforce current grants; they perform no hidden verification preflight.
+Operator policy removal/revocation is required on grant drift; denial is not empty.
+
+For **both** files verify metadata without emitting contents: regular file,
+owner root or the service UID **10001**, service-readable (for example root:10001
+or 10001:10001, mode **0640**), exactly one hardlink, no symlink at the leaf or
+any parent component. The immediate parent must be root/service-owned and not
+group- or other-writable (for example root:10001 mode 0750); UID10001 must be able
+to traverse the entire no-follow directory chain. No world access, execute bits
+or group/other write on the files. Do not relax permissions to bypass an invalid
+state. The loader enforces bounded no-follow reads and rechecks configured-path
+custody; these instructions do not certify filesystem atomicity between checks.
+
+Composition captures paths, and the first local inspection pins custody state.
+Any key/policy replacement, permissions/ownership change, addition after absence
+or rotation requires **explicit service recreation** and a fresh loader; no
+hot-reload or stale-key fallback. Invalid custody latches fail-closed even if the
+file is restored. Rotation/revocation requires separate operator approval and
+coordination with existing integrations; this increment authorizes no generation,
+deletion or regeneration. Never restore a revoked key on code rollback and never
+alter/re-enroll a consumer to make a smoke test pass.
+
+### Exact eleven read tools and interpretation limits
+
+| Tool | Fixed Bing operation |
+| --- | --- |
+| `bing_list_sites` | `GetUserSites` |
+| `bing_rank_traffic_stats` | `GetRankAndTrafficStats` |
+| `bing_query_stats` | `GetQueryStats` |
+| `bing_page_stats` | `GetPageStats` |
+| `bing_page_query_stats` | `GetPageQueryStats` |
+| `bing_query_page_stats` | `GetQueryPageStats` |
+| `bing_crawl_stats` | `GetCrawlStats` |
+| `bing_crawl_issues` | `GetCrawlIssues` |
+| `bing_url_info` | `GetUrlInfo` |
+| `bing_list_sitemaps` | `GetFeeds` |
+| `bing_sitemap_details` | `GetFeedDetails` |
+
+No mutations/admin calls, submission, FetchUrl, IndexNow, generic method proxy,
+deferred tools, automatic fan-out/pagination or cross-platform fusion are added.
+The upstream is fixed HTTPS `ssl.bing.com:443` JSON GET with redirects and ambient
+proxies refused; never log authenticated query URLs or raw provider exceptions.
+Application read-only enforcement does not make the user-wide API key scoped
+read-only at Bing.
+
+Query/page data updates **weekly**, with top-N selection and unknown coverage,
+not an exhaustive daily series. Site traffic/crawl stats have daily cadence;
+six-month retention is documented only for crawl stats. Analytics dates must be
+supplied together (ordered span at most 366 days); strict integer limit 1..1000,
+default 100. Dates/limits filter one response **locally**, not provider date
+parameters or pagination. Preserve raw dates, requested/observed periods, cadence,
+source/returned row counts, local truncation, warnings and
+`provider_completeness=unknown`. UTC-date filtering is a local convention, not
+qualified Bing reporting-day/GSC timezone parity. Never sum mixed weekly/top-N
+buckets into site totals or infer zero traffic from no matching rows.
+
+Keep raw `AvgClickPosition` and `AvgImpressionPosition` **unscaled**;
+`position_scale=undocumented`, normalized `average_position=null`. No guessed
+rank divisor, quick-win scoring or fusion with Google rank. CTR requires valid
+counts; zero denominator is null. Preserve raw query/selector-context caveats and
+crawl-issue masks/unknown bits. `GetUrlInfo`/`UrlInfo` is narrower than GSC URL
+inspection: no live fetch, indexed boolean synthesis, canonical/rich-result or
+GSC-parity claim; `IsPage` is not proof of indexing. Sitemaps return feed metadata,
+not full sitemap URL enumeration. Empty/partial/deferred/denied/provider-error
+outcomes must stay distinct from positive data and business qualification.
+
+### Mandatory staged release, HOLD and later live acceptance
+
+These are **parent-operator-only future gates**, not commands for a local builder:
+
+1. Complete independent offline source/fresh-wheel qualification and triage.
+   GitHub-first protected PR/merge; verify qualified-head/merged-tree equality.
+   Build exact clean merged `main` and qualify the actual immutable final image
+   with pip-audit, SBOM and OS scans. **Any findings or unknown scan result STOP**;
+   retain raw evidence, no inherited old OS/advisory waiver or global suppression.
+2. Before mutation capture the approved own-service resolved Compose config hash
+   and compare with running config (STOP on drift); capture previous immutable
+   image, protected registry digest/metadata and sibling IDs/images/start times/
+   restarts/health. Preserve all unrelated config bytes, resource/security fields,
+   registry/revocations, Google/DataForSEO custody and sibling services.
+3. Deploy only the existing google-seo service, whose repository Compose service
+   key is `google-seo-mcp` (confirm the actual deployed key). Recreate only that
+   service using the qualified immutable image, `--no-deps --no-build --pull never`;
+   no sibling restart, proxy/auth redesign, package install, prune or host change.
+   Keep Bing files absent and required=false. Verify health200, no-key/bad-key401,
+   exact46 catalog, denied fences, Bing provider_not_configured, incumbent35
+   unchanged/healthy, byte-identical consumer registry and unchanged siblings.
+4. **Phase 5: POST HOLD in the assignment thread and WAIT.** No key retrieval,
+   materialization, wiring or live Bing call yet. Automatic completion notices,
+   technical PASS, premature enrollment or general approval do not resume work.
+5. **Only a subsequent Coordinator key-enrolled record after that HOLD** permits
+   phase 6. Validate that exact authority/qualified digest/config first. Then use
+   the existing approved `cypher-agent` identity to fetch only the named Infisical
+   `cypher`/`prod` secret, wire the protected outside-Git file and exact policy in
+   the confirmed deployed layout, and explicitly recreate only google-seo. Do not
+   change the hash-only consumer registry; read back **byte identity** plus metadata
+   and unchanged sibling state after wiring/recreation. Keep required=false until
+   separately authorized grant/provider qualification; local available is not it.
+6. Phase 7 live budget: sequential, **at most one call per Bing tool (11 total),
+   no retries**, plus exactly one `gsc_site_snapshot` and one `serp_check` incumbent
+   check under this gate. Pin `https://google-seo.mcp.propel.marketing/mcp`, reject
+   redirects/proxies and validate target before process-only smoke bearer injection.
+   Require the explicit `https://kelleyconstructioninc.com/` verified pilot from
+   the single discovery call; never select the first discovered site. Abort if
+   absent/unverified. Use approved page/query/sitemap selectors; unavailable
+   selectors mean deferred checks, not writes or extra calls to manufacture data.
+   Retain only sanitized receipts, actual attempts, image/SHA and per-tool outcomes.
+   Positive data/portal comparison is needed for business usefulness, not merely
+   successful transport. A failed auth/read contract STOPs; no account/OAuth/site
+   substitution, synthetic live results or undocumented scaling experiments.
+7. Phase 8 evidence/report and Coordinator independent public re-smoke remain
+   distinct gates. Offline PASS, pending deployment and HOLD are not live Bing
+   acceptance or assignment completion. Skill/consumer-package changes and
+   promotion require a **separate assignment**; do not promote partial/deferred
+   functionality as qualified. Consumers reconnect/restart after authorized catalog
+   promotion to clear cached catalogs; they never need upstream keys.
+
+Rollback restores the previously qualified immutable own-service image and only
+compatible scoped config, then reruns auth/catalog/health/fence checks. Preserve
+current consumer registry bytes, revocations, provider revocations and siblings;
+never roll back credential security state, repair unrelated services or broaden
+exposure. Unknown mutation outcomes require read-only reconciliation before retry.
+Final-image findings, credential exposure, registry drift, incumbent behavior
+change or sibling disturbance are STOP conditions, not reasons to bypass gates.
 
 ## Protected Python logging and audit meaning
 
@@ -205,7 +411,7 @@ test "$(git rev-parse --verify "$REVIEWED_MAIN_SHA^{commit}")" = "$REVIEWED_MAIN
 test "$(git rev-parse refs/remotes/origin/main)" = "$REVIEWED_MAIN_SHA"
 test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
 test -z "$(git status --porcelain --untracked-files=normal)"
-RELEASE_TAG="google-seo-mcp:step52-$REVIEWED_MAIN_SHA"
+RELEASE_TAG="google-seo-mcp:step54-$REVIEWED_MAIN_SHA"
 mkdir -p "$QUALIFICATION_DIR"
 docker buildx build --platform linux/amd64 --pull --load \
   --build-arg "GOOGLE_SEO_REVISION=$REVIEWED_MAIN_SHA" \
@@ -265,8 +471,9 @@ bootstrap pip. Compare image inventory to the locked production wheel evidence.
 Audit the builder's exact pip/setuptools/wheel/packaging versions separately with
 `pip-audit` in that audit environment; never install audit tools into the image.
 No global vulnerability suppression or historical Twisted exception applies.
-Resolve findings or obtain explicit scoped acceptance; no unresolved reachable
-high/critical finding may pass deployment.
+For Step 5.4, any final-image pip-audit, SBOM or OS finding is **STOP**: retain raw
+evidence and return for disposition. Do not reuse an old advisory/applicability
+waiver, suppress findings or continue deployment on a prior release's acceptance.
 
 After qualification, publish/transfer the qualified image using the approved
 release mechanism and retain the immutable registry digest. Configure Compose
@@ -317,7 +524,7 @@ smoke helper can instead use `--check-local-readiness --expected-revision
 The helper validates TLS by default, ignores ambient proxy/CA environment,
 refuses every redirect, checks no-key 401 and minimal health, then uses the real
 SDK to initialize and exhaust `tools/list` pagination. It compares all unique
-names with the installed 35-tool manifest. It makes no `tools/call` request.
+names with the installed 46-tool manifest. It makes no `tools/call` request.
 Its only output is sanitized status/count/revision; public smoke reports revision
 `unavailable` because readiness is local-only. Cleartext is allowed only when
 `--allow-http-host` exactly matches an approved literal loopback/RFC1918/ULA/

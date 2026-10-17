@@ -192,3 +192,134 @@ def test_local_release_revision_fallback_is_explicit(monkeypatch, revision):
         monkeypatch.setenv("GOOGLE_SEO_REVISION", revision)
     with patch("google_seo_mcp.http_app.version", return_value="0.8.5"):
         assert _release_revision() == "0.8.5"
+
+
+@pytest.mark.parametrize("environment", [{}, hosted()])
+def test_bing_exact_defaults_preserve_legacy_and_hosted_configuration(environment):
+    config = load_runtime_config([], environment)
+    assert config.bing_credentials_file == Path("/run/secrets/bing-webmaster.json")
+    assert config.bing_sites_file == Path("/run/secrets/bing-sites.json")
+    assert config.require_bing_credentials is False
+    direct = ProductionRuntimeConfig()
+    assert direct.bing_credentials_file == config.bing_credentials_file
+    assert direct.bing_sites_file == config.bing_sites_file
+    assert direct.require_bing_credentials is False
+
+
+def test_bing_model_has_exactly_three_additive_fields():
+    original = {
+        "transport", "profile", "host", "port", "public_base_url", "accepted_hosts",
+        "accepted_origins", "consumer_keys_file", "service_account_file", "google_auth_mode",
+        "require_google_credentials", "allow_indexnow", "allow_local_files",
+        "allow_private_fetch", "allow_destructive", "debug",
+    }
+    assert set(ProductionRuntimeConfig.model_fields) == original | {
+        "bing_credentials_file", "bing_sites_file", "require_bing_credentials",
+    }
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_bing_strict_path_boolean_repr_and_no_file_or_network_io(required):
+    environment = hosted(
+        GOOGLE_SEO_BING_CREDENTIALS_FILE="/synthetic-private-sentinel/key.json",
+        GOOGLE_SEO_BING_SITES_FILE="/synthetic-private-sentinel/sites.json",
+        GOOGLE_SEO_REQUIRE_BING_CREDENTIALS=str(required),
+    )
+    with (
+        patch("builtins.open", side_effect=AssertionError("unexpected open")),
+        patch.object(Path, "open", side_effect=AssertionError("unexpected path open")),
+        patch.object(Path, "stat", side_effect=AssertionError("unexpected stat")),
+        patch.object(Path, "resolve", side_effect=AssertionError("unexpected resolve")),
+        patch("socket.getaddrinfo", side_effect=AssertionError("unexpected DNS")),
+        patch("socket.socket", side_effect=AssertionError("unexpected socket")),
+    ):
+        config = load_runtime_config([], environment)
+        direct = ProductionRuntimeConfig(
+            bing_credentials_file=Path("/synthetic-private-sentinel/key.json"),
+            bing_sites_file="/synthetic-private-sentinel/sites.json",
+            require_bing_credentials=required,
+        )
+    for result in (config, direct):
+        assert result.bing_credentials_file == Path("/synthetic-private-sentinel/key.json")
+        assert result.bing_sites_file == Path("/synthetic-private-sentinel/sites.json")
+        assert result.require_bing_credentials is required
+        assert "synthetic-private-sentinel" not in repr(result)
+        assert "synthetic-private-sentinel" not in str(result)
+    assert config.google_auth_mode == "service-account"
+    assert config.require_google_credentials is False
+
+
+@pytest.mark.parametrize("field,variable", [
+    ("bing_credentials_file", "GOOGLE_SEO_BING_CREDENTIALS_FILE"),
+    ("bing_sites_file", "GOOGLE_SEO_BING_SITES_FILE"),
+])
+@pytest.mark.parametrize("value", [
+    "", "private-sentinel.json", "~/private-sentinel.json", "/", "//private-sentinel/x",
+    "/private-sentinel/../x", "/private-sentinel/./x", "/private-sentinel//x",
+    "/private-sentinel/", "/private-sentinel\n/x", "/private-sentinel\x00/x",
+    "/private-sentinel\x7f/x", "/private-sentinel\\x", "/private-sentinel /x",
+    "https://private-sentinel/x", "file:///private-sentinel/x", "/private-sentinel/\ud800",
+    None, True, 1, b"/private-sentinel/x", [], {},
+])
+def test_bing_paths_are_strict_absolute_and_errors_hide_values(field, variable, value, capsys):
+    with pytest.raises(ValidationError) as direct:
+        ProductionRuntimeConfig(**{field: value})
+    assert "private-sentinel" not in str(direct.value)
+    assert "private-sentinel" not in repr(direct.value)
+    with pytest.raises(RuntimeConfigurationError) as loaded:
+        load_runtime_config([], {variable: value})
+    assert str(loaded.value) == "invalid runtime configuration"
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("value", ["true", "false", "1", "0", 1, 0, 1.0, None, [], {}])
+def test_bing_required_direct_model_rejects_non_boolean_values(value):
+    with pytest.raises(ValidationError):
+        ProductionRuntimeConfig(require_bing_credentials=value)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("TRUE", True), ("True", True), ("1", True), ("yes", True),
+    ("on", True), ("y", True), ("t", True), ("false", False), ("FALSE", False),
+    ("0", False), ("no", False), ("off", False), ("n", False), ("f", False),
+])
+def test_bing_required_env_uses_existing_explicit_boolean_parser(value, expected):
+    config = load_runtime_config([], hosted(GOOGLE_SEO_REQUIRE_BING_CREDENTIALS=value))
+    assert config.require_bing_credentials is expected
+
+
+@pytest.mark.parametrize("value", ["", " true ", "sometimes", "private-sentinel", "2"])
+def test_bing_required_env_invalid_boolean_is_sanitized(value):
+    with pytest.raises(RuntimeConfigurationError, match="^invalid runtime configuration$"):
+        load_runtime_config([], {"GOOGLE_SEO_REQUIRE_BING_CREDENTIALS": value})
+
+
+@pytest.mark.parametrize("option", [
+    "--bing-credentials-file", "--bing-sites-file", "--require-bing-credentials",
+])
+def test_bing_adds_no_cli_options(option, capsys):
+    with pytest.raises(RuntimeConfigurationError, match="^invalid runtime configuration$"):
+        load_runtime_config([option, "private-sentinel"], {})
+    assert capsys.readouterr() == ("", "")
+
+
+def test_bing_configuration_is_frozen_path_only_without_key_or_home_fallback():
+    config = load_runtime_config([], {
+        "HOME": "/synthetic-private-sentinel",
+        "BING_API_KEY": "synthetic-private-sentinel",
+        "BING_WEBMASTER_API_KEY": "synthetic-private-sentinel",
+        "GOOGLE_SEO_BING_API_KEY": "synthetic-private-sentinel",
+    })
+    assert config.bing_credentials_file == Path("/run/secrets/bing-webmaster.json")
+    assert config.bing_sites_file == Path("/run/secrets/bing-sites.json")
+    assert "synthetic-private-sentinel" not in repr(config)
+    for field, value in (
+        ("bing_credentials_file", Path("/synthetic/key.json")),
+        ("bing_sites_file", Path("/synthetic/sites.json")),
+        ("require_bing_credentials", True),
+    ):
+        with pytest.raises(ValidationError):
+            setattr(config, field, value)
+    for field in ("bing_api_key", "bing_base_url", "bing_auth_mode"):
+        with pytest.raises(ValidationError):
+            ProductionRuntimeConfig(**{field: "synthetic-private-sentinel"})
