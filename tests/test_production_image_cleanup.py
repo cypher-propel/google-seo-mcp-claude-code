@@ -117,13 +117,25 @@ def test_extracted_global_guard_requires_no_distributions(tmp_path, names):
         "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     }
-    # Redirect only discovery's search root. Real stdlib distribution metadata is
-    # used, and the extracted production assertion executes unchanged.
+    # Synthetic removed-module profile, NOT actual image execution or removal.
+    # Redirect metadata's search root only: real stdlib discovery stays unchanged.
+    # Model the five removed modules independently of host ensurepip availability;
+    # all other module lookups delegate to the real finder. Run the guard unchanged.
     harness = """
 import importlib.metadata as metadata
+import importlib.util as util
+from importlib.machinery import ModuleSpec
 import sys
 discover = metadata.distributions
 metadata.distributions = lambda: discover(path=[sys.argv[2]])
+find_spec = util.find_spec
+removed = {'pip', 'ensurepip', 'setuptools', 'wheel', 'packaging'}
+present = sys.argv[3] if len(sys.argv) > 3 else None
+def controlled_find_spec(name, package=None):
+    if name in removed:
+        return ModuleSpec(name, loader=None) if name == present else None
+    return find_spec(name, package)
+util.find_spec = controlled_find_spec
 exec(compile(sys.argv[1], '<Dockerfile global cleanup>', 'exec'))
 """
     result = subprocess.run(
@@ -134,6 +146,17 @@ exec(compile(sys.argv[1], '<Dockerfile global cleanup>', 'exec'))
     if not names:
         assert result.returncode == 0, result.stderr
         assert result.stderr == ""
+        # Empty real metadata must not let any one remaining module pass.
+        # ModuleSpec emulates presence without installing a package on the host.
+        for module in ("pip", "ensurepip", "setuptools", "wheel", "packaging"):
+            present_result = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", harness, guard,
+                 str(metadata_path), module],
+                env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=10,
+            )
+            assert present_result.stdout == ""
+            assert present_result.returncode != 0, f"global module {module} unexpectedly accepted"
+            assert "AssertionError" in present_result.stderr, present_result.stderr
     else:
         assert result.returncode != 0, "global distribution unexpectedly accepted"
         assert "AssertionError" in result.stderr, result.stderr
