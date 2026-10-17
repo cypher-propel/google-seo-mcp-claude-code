@@ -43,6 +43,8 @@ def probe(tmp_path, code, scope=None):
         "PATH": f"{Path(interpreter).parent}:/usr/local/bin:/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
     }
+    if "GOOGLE_SEO_TEST_PYTHON" not in os.environ:
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
     if scope is not None:
         environment["GOOGLE_SDK_PYTHON_LOGGING_SCOPE"] = scope
     return subprocess.run(
@@ -259,13 +261,13 @@ root = logging.getLogger()
 original = (logging.Logger.callHandlers, logging.lastResort, root.handlers[:], root.level)
 first = server.create_server(hosted)
 second = server.create_server(hosted)
-assert len(first._tool_manager.list_tools()) == len(second._tool_manager.list_tools()) == 35
+assert len(first._tool_manager.list_tools()) == len(second._tool_manager.list_tools()) == 46
 late = logging.getLogger('restore.created.hosted')
 late.handlers[:] = [logging.StreamHandler(sys.stderr)]
 late.propagate = False
 late.setLevel(logging.DEBUG)
 legacy = server.create_server(load_runtime_config([], {}))
-assert len(legacy._tool_manager.list_tools()) == 102
+assert len(legacy._tool_manager.list_tools()) == 113
 assert (logging.Logger.callHandlers, logging.lastResort, root.handlers, root.level) == original
 assert logger.handlers == [handler] and logger.level == logging.WARNING and not logger.propagate
 assert late.handlers == [] and late.propagate and late.level == logging.NOTSET

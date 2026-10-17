@@ -24,9 +24,13 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools.base import Tool
 from mcp.server.fastmcp.tools.tool_manager import ToolManager
+from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import ValidationError
+from mcp.types import ToolAnnotations
+from pydantic import ConfigDict, ValidationError, create_model
 
+from .bing import auth as bing_auth
+from .bing import tools as bing_tools
 from .consumer_auth import (
     AuthenticatedConsumer, _HOSTED_AUDIT_MARKER, _audit_tool_names, _hosted_audit_message,
     consumer_context, emit_hosted_audit, request_id_context,
@@ -144,6 +148,7 @@ def _safe_tool_error(exc: Exception) -> str:
             and type(exc.args[0]) is str and exc.args[0] in (
         "credentials_missing", "credentials_invalid", "vendor_unavailable",
         "google_client_unavailable", "provider_unavailable",
+        "provider_not_configured", "invalid_request", "provider_error",
     )):
         return exc.args[0]
     return "provider_unavailable"
@@ -227,6 +232,7 @@ class PolicyToolManager(ToolManager):
                 "credentials_missing", "credentials_invalid", "vendor_unavailable",
                 "google_client_unavailable", "provider_unavailable", "invalid_tool_arguments",
                 "tool_not_allowed",
+                "provider_not_configured", "invalid_request", "provider_error",
             ) else _safe_tool_error(exc)
             raise ToolError(code) from None
         finally:
@@ -288,6 +294,7 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
     ("gsc_", "gsc"),
     # GA4
     ("ga4_", "ga4"),
+    ("bing_", "bing"),
     # Performance
     ("lighthouse_", "lighthouse"),
     ("crux_", "crux"),
@@ -400,6 +407,64 @@ def _register(fn, *, name: str):
     if not base_doc.endswith(GUARDRAIL_SUFFIX.rstrip()):
         fn.__doc__ = base_doc + GUARDRAIL_SUFFIX
     return mcp.tool(name=name)(fn)
+
+
+class _BingFuncMetadata(FuncMetadata):
+    """Keep original scalar values for strict Bing-only SDK validation.
+
+    The SDK normally JSON-decodes e.g. limit="100" before validation. Incumbent
+    tools retain their original models and pre-parser/coercion behavior.
+    """
+
+    def pre_parse_json(self, data):
+        return data
+
+
+def _register_bing(manager: ToolManager, fn, *, name: str) -> None:
+    """Install Bing-only schema, error boundary and annotations in any registry."""
+    base_doc = (fn.__doc__ or "").rstrip()
+    if not base_doc.endswith(GUARDRAIL_SUFFIX.rstrip()):
+        fn.__doc__ = base_doc + GUARDRAIL_SUFFIX
+    tool = manager.add_tool(fn, name=name, annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, openWorldHint=False,
+    ))
+    metadata = tool.fn_metadata
+    argument_model = create_model(
+        f"{name}StrictArguments", __base__=metadata.arg_model,
+        __config__=ConfigDict(strict=True, extra="forbid"),
+    )
+    tool.fn_metadata = _BingFuncMetadata(
+        arg_model=argument_model, output_schema=metadata.output_schema,
+        output_model=metadata.output_model, wrap_output=metadata.wrap_output,
+    )
+    tool.parameters = argument_model.model_json_schema(by_alias=True)
+    # Legacy SDK Tool.run includes exception values. Use safe execution for Bing
+    # in legacy mode too, without replacing any incumbent tool or its metadata.
+    if not isinstance(tool, HostedTool):
+        tool = HostedTool(**{
+            field: getattr(tool, field) for field in Tool.model_fields
+        })
+        manager._tools[name] = tool
+
+
+# Exact eleven reads, registered before legacy capture and reused for rebuilds.
+# No configure/reset seam or aliases are admitted.
+_BING_TOOL_DEFINITIONS = (
+    (bing_tools.bing_list_sites, "bing_list_sites"),
+    (bing_tools.bing_rank_traffic_stats, "bing_rank_traffic_stats"),
+    (bing_tools.bing_query_stats, "bing_query_stats"),
+    (bing_tools.bing_page_stats, "bing_page_stats"),
+    (bing_tools.bing_page_query_stats, "bing_page_query_stats"),
+    (bing_tools.bing_query_page_stats, "bing_query_page_stats"),
+    (bing_tools.bing_crawl_stats, "bing_crawl_stats"),
+    (bing_tools.bing_crawl_issues, "bing_crawl_issues"),
+    (bing_tools.bing_url_info, "bing_url_info"),
+    (bing_tools.bing_list_sitemaps, "bing_list_sitemaps"),
+    (bing_tools.bing_sitemap_details, "bing_sitemap_details"),
+)
+_BING_TOOL_NAMES = frozenset(name for _, name in _BING_TOOL_DEFINITIONS)
+for _bing_fn, _bing_name in _BING_TOOL_DEFINITIONS:
+    _register_bing(mcp._tool_manager, _bing_fn, name=_bing_name)
 
 
 # ─── GSC: sites & inspection ─────────────────────────────────
@@ -758,7 +823,7 @@ def get_capabilities() -> dict:
 
 
 # Capture callable definitions once, before any transport selection. A later CLI
-# override rebuilds its own manager and never reuses the legacy 102-tool manager.
+# override rebuilds its own manager and never reuses the legacy 113-tool manager.
 _LEGACY_TOOL_DEFINITIONS = tuple((tool.fn, tool.name) for tool in mcp._tool_manager.list_tools())
 
 # Initial catalog construction is transport-neutral: do not enable SDK debug
@@ -779,11 +844,16 @@ def create_server(config: ProductionRuntimeConfig) -> FastMCP:
     Independent stdio/HTTP processes are the supported lifecycle; auth identity is
     process-wide and intentionally shared by all hosted consumers.
     """
+    bing_auth.configure_bing_auth(config)
+    bing_tools.configure_bing_tools()
     if config.profile == "production":
         instance = ProductionFastMCP(config)
         for fn, name in _LEGACY_TOOL_DEFINITIONS:
             if instance.production_policy.is_tool_allowed(name):
-                instance.add_tool(fn, name=name)
+                if name in _BING_TOOL_NAMES:
+                    _register_bing(instance._tool_manager, fn, name=name)
+                else:
+                    instance.add_tool(fn, name=name)
         registered = {tool.name for tool in instance._tool_manager.list_tools()}
         if registered != instance.production_policy.names:
             raise ToolPolicyError("production tool registry mismatch")
@@ -792,7 +862,10 @@ def create_server(config: ProductionRuntimeConfig) -> FastMCP:
         auth_module.configure_hosted_auth(config)
         instance = FastMCP("google-seo-mcp")
         for fn, name in _LEGACY_TOOL_DEFINITIONS:
-            instance.add_tool(fn, name=name)
+            if name in _BING_TOOL_NAMES:
+                _register_bing(instance._tool_manager, fn, name=name)
+            else:
+                instance.add_tool(fn, name=name)
     instance.resource("google-seo://algorithm-updates")(google_algorithm_updates_resource)
     return instance
 

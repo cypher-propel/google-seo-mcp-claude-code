@@ -11,6 +11,21 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_production_startup import (
+    BING_NAMES,
+    GUARDED_BOOT,
+    LEGACY_NAMES,
+    _assert_child_provenance,
+    _child_provenance,
+)
+
+# Historical 35, independently selected from the immutable original stdio golden.
+# This does not read the candidate manifest or discover implementation names.
+ORIGINAL_PRODUCTION_NAMES = frozenset(
+    name for name in LEGACY_NAMES
+    if name.startswith(('gsc_', 'ga4_', 'cross_')) and name != 'gsc_submit_sitemap'
+) | {'serp_check', 'serp_aio_monitor', 'serp_paa_extractor', 'serp_competitor_intersect'}
+
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN = {
     "advertools", "scrapy", "twisted", "playwright", "statsmodels", "scipy", "pytest",
@@ -75,11 +90,18 @@ sys.meta_path.insert(0, NoCrawler())
 from google_seo_mcp.server import create_server
 from google_seo_mcp.runtime_config import load_runtime_config
 instance = create_server(load_runtime_config([]))
-assert len(instance._tool_manager.list_tools()) == 102
-'''
-    result = subprocess.run([sys.executable, "-c", code],
-                            env=child_environment(tmp_path, sys.executable),
+expected = set(EXPECTED_NAMES)
+names = [tool.name for tool in instance._tool_manager.list_tools()]
+assert len(names) == len(set(names)) == 113
+assert set(names) == expected
+'''.replace('EXPECTED_NAMES', repr(LEGACY_NAMES + BING_NAMES))
+    environment, provenance, proof = _child_provenance(
+        child_environment(tmp_path, sys.executable), sys.executable, receipt_name='no-crawler',
+    )
+    result = subprocess.run([sys.executable, '-c', GUARDED_BOOT + provenance + code],
+                            env=environment,
                             cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    _assert_child_provenance(proof)
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
 
@@ -129,7 +151,7 @@ from google_seo_mcp.server import create_server
 from google_seo_mcp.runtime_config import load_runtime_config
 from google_seo_mcp.migration.wp_audit import crawl_site_advertools
 from google_seo_mcp._dep_check import probe_optional_deps
-expected, forbidden, pip_version, source = json.loads(sys.argv[1])
+expected, forbidden, pip_version, source, production_names, legacy_names = json.loads(sys.argv[1])
 normal = lambda n: n.lower().replace('_', '-')
 actual = {normal(d.metadata['Name']): d.version for d in metadata.distributions()}
 assert not set(actual) & set(forbidden), sorted(set(actual) & set(forbidden))
@@ -144,7 +166,8 @@ direct = package.read_text('direct_url.json')
 assert not direct or not json.loads(direct).get('dir_info', {}).get('editable', False)
 manifest = json.loads(
     resources.files('google_seo_mcp').joinpath('production_tools.json').read_text())
-assert manifest['version'] == 1 and len(manifest['tools']) == len(set(manifest['tools'])) == 35
+assert manifest['version'] == 1 and len(manifest['tools']) == len(set(manifest['tools'])) == 46
+assert set(manifest['tools']) == set(production_names)
 assert util.find_spec('advertools') is None and util.find_spec('twisted') is None
 assert 'advertools' not in sys.modules
 report = probe_optional_deps()
@@ -156,14 +179,25 @@ except ModuleNotFoundError as error:
     assert error.name == 'advertools'
 else:
     raise AssertionError('crawler unexpectedly available')
-assert len(create_server(load_runtime_config([]))._tool_manager.list_tools()) == 102
+names = [tool.name for tool in create_server(load_runtime_config([]))._tool_manager.list_tools()]
+assert len(names) == len(set(names)) == 113
+assert set(names) == set(legacy_names)
 print(json.dumps({'runtime_packages': len(actual), 'manifest_tools': len(manifest['tools']),
                   'noneditable': True, 'twisted': 'absent'}))
 '''
-    environment = child_environment(tmp_path, executable)
-    result = subprocess.run([executable, "-c", code, json.dumps([
-        expected, sorted(FORBIDDEN), pip_pin.group(1), str(ROOT / "src")])], env=environment,
-        cwd=tmp_path, capture_output=True, text=True, timeout=40)
+    assert len(ORIGINAL_PRODUCTION_NAMES) == 35
+    assert len(LEGACY_NAMES) == len(set(LEGACY_NAMES)) == 102
+    assert len(BING_NAMES) == len(set(BING_NAMES)) == 11
+    assert not set(LEGACY_NAMES) & set(BING_NAMES)
+    environment, provenance, proof = _child_provenance(
+        child_environment(tmp_path, executable), executable,
+        installed=True, receipt_name='strict-runtime',
+    )
+    result = subprocess.run([executable, '-c', GUARDED_BOOT + provenance + code, json.dumps([
+        expected, sorted(FORBIDDEN), pip_pin.group(1), str(ROOT / 'src'),
+        sorted(ORIGINAL_PRODUCTION_NAMES | set(BING_NAMES)), LEGACY_NAMES + BING_NAMES,
+    ])], env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=40)
+    _assert_child_provenance(proof)
     assert result.returncode == 0, result.stderr
     summary = json.loads(result.stdout)
     assert summary["noneditable"] and summary["twisted"] == "absent"

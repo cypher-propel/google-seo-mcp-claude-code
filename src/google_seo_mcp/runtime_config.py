@@ -69,11 +69,33 @@ class ProductionRuntimeConfig(BaseModel):
     service_account_file: Path | None = Field(default=None, repr=False)
     google_auth_mode: Literal["legacy", "service-account"] = "legacy"
     require_google_credentials: bool = False
+    bing_credentials_file: Path = Field(
+        default=Path("/run/secrets/bing-webmaster.json"), repr=False
+    )
+    bing_sites_file: Path = Field(default=Path("/run/secrets/bing-sites.json"), repr=False)
+    require_bing_credentials: bool = Field(default=False, strict=True)
     allow_indexnow: bool = False
     allow_local_files: bool = False
     allow_private_fetch: bool = False
     allow_destructive: bool = False
     debug: bool = False
+
+    @field_validator("bing_credentials_file", "bing_sites_file", mode="before")
+    @classmethod
+    def validate_bing_path(cls, value: object) -> Path:
+        # Lexical validation only: custody/existence checks belong to the lazy loader.
+        if not isinstance(value, (str, Path)):
+            raise ValueError("invalid Bing configuration path")
+        text = str(value)
+        if (
+            not text.startswith("/")
+            or any(part in ("", ".", "..") for part in text.split("/")[1:])
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in text)
+            or "\\" in text
+            or any(0xD800 <= ord(c) <= 0xDFFF for c in text)
+        ):
+            raise ValueError("invalid Bing configuration path")
+        return Path(text)
 
     @field_validator("host")
     @classmethod
@@ -178,6 +200,12 @@ def load_runtime_config(
             or (
                 "/run/secrets/google-seo-service-account.json" if profile == "production" else None
             ),
+            "bing_credentials_file": environment.get(
+                "GOOGLE_SEO_BING_CREDENTIALS_FILE", "/run/secrets/bing-webmaster.json"
+            ),
+            "bing_sites_file": environment.get(
+                "GOOGLE_SEO_BING_SITES_FILE", "/run/secrets/bing-sites.json"
+            ),
         }
         for field, variable in (
             ("accepted_hosts", "GOOGLE_SEO_ACCEPTED_HOSTS"),
@@ -189,6 +217,7 @@ def load_runtime_config(
                 fields[field] = tuple(part.strip() for part in environment[variable].split(","))
         for field, variable in (
             ("require_google_credentials", "GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS"),
+            ("require_bing_credentials", "GOOGLE_SEO_REQUIRE_BING_CREDENTIALS"),
             ("allow_indexnow", "GOOGLE_SEO_ALLOW_INDEXNOW"),
             ("allow_local_files", "GOOGLE_SEO_ALLOW_LOCAL_FILES"),
             ("allow_private_fetch", "GOOGLE_SEO_ALLOW_PRIVATE_FETCH"),

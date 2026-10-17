@@ -50,7 +50,41 @@ EXPECTED = frozenset(
     "serp_paa_extractor",
     "serp_competitor_intersect",
 }
-EXCLUDED = BASELINE - EXPECTED
+# Keep the historical 35-tool sink/semantics matrix separate from Bing.
+ORIGINAL_EXPECTED = EXPECTED
+BING_NAMES = frozenset({
+    "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats",
+    "bing_page_stats", "bing_page_query_stats", "bing_query_page_stats",
+    "bing_crawl_stats", "bing_crawl_issues", "bing_url_info",
+    "bing_list_sitemaps", "bing_sitemap_details",
+})
+EXPECTED = ORIGINAL_EXPECTED | BING_NAMES
+EXCLUDED = BASELINE - ORIGINAL_EXPECTED
+# Independent accepted-plan section 2/5 inventory: mutations (including GET
+# FetchUrl), deferred reads, generic proxies, configuration seams and aliases.
+BING_FORBIDDEN = [
+    "bing_add_site", "bing_remove_site", "bing_verify_site",
+    "bing_add_site_roles", "bing_remove_site_role",
+    "bing_submit_url", "bing_submit_url_batch", "bing_submit_content",
+    "bing_submit_feed", "bing_submit_sitemap", "bing_remove_feed",
+    "bing_fetch_url", "bing_save_crawl_settings", "bing_add_blocked_url",
+    "bing_remove_blocked_url", "bing_add_country_region_settings",
+    "bing_remove_country_region_settings", "bing_add_query_parameter",
+    "bing_remove_query_parameter", "bing_enable_disable_query_parameter",
+    "bing_add_connected_page", "bing_submit_site_move", "bing_update_deep_link",
+    "bing_block_page_preview", "bing_block_deep_link",
+    "bing_query_page_detail_stats", "bing_query_traffic_stats",
+    "bing_url_traffic", "bing_link_counts", "bing_url_links",
+    "bing_keyword_stats", "bing_related_keywords", "bing_keyword",
+    "bing_url_submission_quota", "bing_content_submission_quota",
+    "bing_crawl_settings", "bing_call", "bing_request", "bing_api",
+    "bing_get_user_sites", "bing_sites_list", "bing_feeds_list",
+    "bing_feed_details", "bing_future_read", "configure_bing_tools",
+    "configure_bing_auth", "BING_LIST_SITES", " bing_list_sites",
+    "bing_list_sites ", "bing_list_sites/", "bing_list_sites\n",
+    "tools/call/bing_list_sites", "../bing_list_sites", "GetUserSites",
+    "SubmitUrl", "FetchUrl", "bing_indexnow_submit",
+]
 ALIASES = [
     "gsc_future_read",
     "ga4_future_read",
@@ -81,11 +115,14 @@ def hosted(monkeypatch):
 
 def test_catalog_is_exact_static_baseline_expansion_and_stdio_is_intact(hosted):
     assert len(BASELINE) == 102
-    assert len(EXPECTED) == 35
+    assert len(ORIGINAL_EXPECTED) == 35
+    assert len(BING_NAMES) == 11
+    assert not BASELINE & BING_NAMES
+    assert len(EXPECTED) == 46
     assert len(EXCLUDED) == 67
     assert ProductionToolPolicy().names == EXPECTED
     assert {tool.name for tool in hosted._tool_manager.list_tools()} == EXPECTED
-    assert {tool.name for tool in server.mcp._tool_manager.list_tools()} == BASELINE
+    assert {tool.name for tool in server.mcp._tool_manager.list_tools()} == BASELINE | BING_NAMES
     manifest = json.loads(
         tool_policy.files("google_seo_mcp").joinpath("production_tools.json").read_text()
     )
@@ -95,7 +132,7 @@ def test_catalog_is_exact_static_baseline_expansion_and_stdio_is_intact(hosted):
     assert hosted.settings.streamable_http_path == "/mcp"
 
 
-@pytest.mark.parametrize("name", sorted(EXCLUDED) + ALIASES)
+@pytest.mark.parametrize("name", sorted(EXCLUDED) + ALIASES + BING_FORBIDDEN)
 @pytest.mark.parametrize("seam", ["manager", "fastmcp", "sdk-handler"])
 def test_every_excluded_name_and_alias_denied_before_open_dns_or_socket(hosted, name, seam):
     async def exercise():
@@ -143,7 +180,8 @@ def test_every_excluded_name_and_alias_denied_before_open_dns_or_socket(hosted, 
 @pytest.mark.parametrize("seam", ["add_tool", "decorator", "manager", "register"])
 @pytest.mark.parametrize(
     "name",
-    ["gsc_future_read", "ga4_future_read", "cross_future_read", "serp_future_read", "logs_parse"],
+    ["gsc_future_read", "ga4_future_read", "cross_future_read", "serp_future_read", "logs_parse"]
+    + BING_FORBIDDEN,
 )
 def test_future_prefix_and_forbidden_registration_cannot_expand_policy(
     hosted, monkeypatch, seam, name
@@ -151,7 +189,15 @@ def test_future_prefix_and_forbidden_registration_cannot_expand_policy(
     def harmless() -> dict:
         return {}
 
-    with pytest.raises(ToolPolicyError, match="^tool_not_allowed$"):
+    sink = Mock(side_effect=AssertionError("forbidden registration reached file/network"))
+    with (
+        patch("builtins.open", sink),
+        patch.object(Path, "open", sink),
+        patch.object(socket, "getaddrinfo", sink),
+        patch.object(socket.socket, "connect", sink),
+        patch.object(socket.socket, "connect_ex", sink),
+        pytest.raises(ToolPolicyError, match="^tool_not_allowed$"),
+    ):
         if seam == "add_tool":
             hosted.add_tool(harmless, name=name)
         elif seam == "decorator":
@@ -161,6 +207,7 @@ def test_future_prefix_and_forbidden_registration_cannot_expand_policy(
         else:
             monkeypatch.setattr(server, "mcp", hosted)
             server._register(harmless, name=name)
+    sink.assert_not_called()
     assert {tool.name for tool in hosted._tool_manager.list_tools()} == EXPECTED
 
 
@@ -256,7 +303,7 @@ class GoogleSinkStub:
         return invoke
 
 
-@pytest.mark.parametrize("name", sorted(EXPECTED))
+@pytest.mark.parametrize("name", sorted(ORIGINAL_EXPECTED))
 def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
     hosted, monkeypatch, name
 ):
@@ -333,6 +380,8 @@ def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
             stack.enter_context(patch.object(Path, "open", sink))
             stack.enter_context(patch.object(socket, "getaddrinfo", sink))
             stack.enter_context(patch.object(socket.socket, "connect", sink))
+            stack.enter_context(patch.object(socket.socket, "connect_ex", sink))
+            stack.enter_context(patch.object(server.bing_tools, "_read", sink))
             await hosted._tool_manager.call_tool(name, arguments)
         sink.assert_not_called()
         assert bool(vendor_calls) == name.startswith("serp_")
@@ -396,6 +445,7 @@ def denied(*args, **kwargs):
     raise AssertionError("UNEXPECTED_PROVIDER_ATTEMPT")
 socket.getaddrinfo = denied
 socket.socket.connect = denied
+socket.socket.connect_ex = denied
 server.auth_module.google_auth_default = denied
 server.auth_module.SACredentials.from_service_account_file = denied
 
@@ -444,7 +494,8 @@ async def exercise():
         finally:
             consumer_context.reset(consumer)
             request_id_context.reset(request_id)
-    print(json.dumps({'results': results, 'logs': captured.getvalue()}))
+    print(json.dumps({'results': results, 'logs': captured.getvalue(),
+                      'server_file': server.__file__}))
 asyncio.run(exercise())
 """
 
@@ -461,6 +512,9 @@ def test_actual_hosted_audit_redacts_args_results_provider_and_sdk_failures(tmp_
         "PYTHONUNBUFFERED": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        # Pin the same source tree OR installed wheel as the parent interpreter;
+        # a clean env must not silently select an older installed distribution.
+        "PYTHONPATH": str(Path(server.__file__).resolve().parent.parent),
     }
     result = subprocess.run(
         [sys.executable, "-c", AUDIT_PROBE],
@@ -473,6 +527,7 @@ def test_actual_hosted_audit_redacts_args_results_provider_and_sdk_failures(tmp_
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     projection = json.loads(result.stdout)
+    assert Path(projection["server_file"]).resolve() == Path(server.__file__).resolve()
     responses, log_text = projection["results"], projection["logs"]
     assert len(responses) == 6
     expected_errors = [

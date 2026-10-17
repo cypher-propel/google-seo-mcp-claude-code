@@ -14,6 +14,23 @@ from importlib.resources import files
 from urllib.parse import urlsplit
 
 PUBLIC_AUTHORITY = "google-seo.mcp.propel.marketing"
+# Independent hosted admission: frozen historical 35 plus the approved eleven Bing reads.
+EXPECTED_TOOLS = frozenset({
+    "cross_gsc_to_ga4_journey", "cross_landing_page_full_diagnosis",
+    "cross_multi_property_comparison", "cross_opportunity_matrix",
+    "cross_seo_to_revenue_attribution", "cross_traffic_health_check",
+    "ga4_anomalies", "ga4_channel_attribution", "ga4_cohort_retention",
+    "ga4_content_decay", "ga4_conversion_funnel", "ga4_estimate_query_size",
+    "ga4_event_volume_comparison", "ga4_get_property_details", "ga4_landing_page_health",
+    "ga4_list_properties", "ga4_list_schema_categories", "ga4_query", "ga4_search_schema",
+    "ga4_traffic_drops_by_channel", "gsc_alerts", "gsc_cannibalization", "gsc_content_decay",
+    "gsc_ctr_opportunities", "gsc_inspect_url", "gsc_list_sitemaps", "gsc_list_sites",
+    "gsc_quick_wins", "gsc_search_analytics", "gsc_site_snapshot", "gsc_traffic_drops",
+    "serp_aio_monitor", "serp_check", "serp_competitor_intersect", "serp_paa_extractor",
+    "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats", "bing_page_stats",
+    "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
+    "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
+})
 PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
     "100.64.0.0/10", "::1/128", "fc00::/7",
@@ -77,7 +94,7 @@ async def smoke(options: argparse.Namespace) -> dict[str, str | int]:
     manifest = json.loads(files("google_seo_mcp").joinpath("production_tools.json").read_text())
     expected = manifest["tools"]
     if (
-        manifest["version"] != 1 or len(expected) != 35
+        manifest["version"] != 1 or set(expected) != EXPECTED_TOOLS
         or len(set(expected)) != len(expected)
     ):
         raise SmokeFailure()

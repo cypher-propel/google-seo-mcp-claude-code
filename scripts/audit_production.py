@@ -22,6 +22,23 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_PIP = "26.2.1"  # Separately pinned/hash-checked in Dockerfile.
+# Independent hosted admission: frozen historical 35 plus the approved eleven Bing reads.
+EXPECTED_TOOLS = frozenset({
+    "cross_gsc_to_ga4_journey", "cross_landing_page_full_diagnosis",
+    "cross_multi_property_comparison", "cross_opportunity_matrix",
+    "cross_seo_to_revenue_attribution", "cross_traffic_health_check",
+    "ga4_anomalies", "ga4_channel_attribution", "ga4_cohort_retention",
+    "ga4_content_decay", "ga4_conversion_funnel", "ga4_estimate_query_size",
+    "ga4_event_volume_comparison", "ga4_get_property_details", "ga4_landing_page_health",
+    "ga4_list_properties", "ga4_list_schema_categories", "ga4_query", "ga4_search_schema",
+    "ga4_traffic_drops_by_channel", "gsc_alerts", "gsc_cannibalization", "gsc_content_decay",
+    "gsc_ctr_opportunities", "gsc_inspect_url", "gsc_list_sitemaps", "gsc_list_sites",
+    "gsc_quick_wins", "gsc_search_analytics", "gsc_site_snapshot", "gsc_traffic_drops",
+    "serp_aio_monitor", "serp_check", "serp_competitor_intersect", "serp_paa_extractor",
+    "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats", "bing_page_stats",
+    "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
+    "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
+})
 FORBIDDEN = {
     "advertools",
     "scrapy",
@@ -201,7 +218,11 @@ def validate_inventory(probe: dict, inspect: dict, freeze: str, lock: dict) -> d
     if "-e " in freeze or "__editable__" in freeze:
         raise AuditBlocked("editable_install")
     manifest = parse_json((ROOT / "src/google_seo_mcp/production_tools.json").read_text())
-    if probe["manifest"] != manifest or len(manifest["tools"]) != 35:
+    if (
+        probe["manifest"] != manifest or manifest["version"] != 1
+        or set(manifest["tools"]) != EXPECTED_TOOLS
+        or len(set(manifest["tools"])) != len(manifest["tools"])
+    ):
         raise AuditBlocked("manifest_mismatch")
     return actual
 

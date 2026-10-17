@@ -35,6 +35,11 @@ services:
       GOOGLE_SEO_CONSUMER_KEYS_FILE: /run/secrets/consumer-keys.json
       GOOGLE_SEO_SERVICE_ACCOUNT_FILE: /run/secrets/google-seo-service-account.json
       GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS: "${GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS:-false}"
+      # Paths only; reuse /run/secrets. Absent Bing files are intentional until
+      # the runbook HOLD/resume gate; never inject a literal API key here.
+      GOOGLE_SEO_BING_CREDENTIALS_FILE: /run/secrets/bing-webmaster.json
+      GOOGLE_SEO_BING_SITES_FILE: /run/secrets/bing-sites.json
+      GOOGLE_SEO_REQUIRE_BING_CREDENTIALS: "${GOOGLE_SEO_REQUIRE_BING_CREDENTIALS:-false}"
       GSC_ALLOW_DESTRUCTIVE: "false"
       GOOGLE_SEO_ALLOW_INDEXNOW: "false"
       GOOGLE_SEO_ALLOW_LOCAL_FILES: "false"

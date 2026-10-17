@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -125,6 +126,113 @@ LEGACY_NAMES = (
     'serp_paa_extractor',
 )
 
+# Independent additive golden; LEGACY_NAMES above remains the historical AST fixture.
+BING_NAMES = (
+    'bing_list_sites', 'bing_rank_traffic_stats', 'bing_query_stats',
+    'bing_page_stats', 'bing_page_query_stats', 'bing_query_page_stats',
+    'bing_crawl_stats', 'bing_crawl_issues', 'bing_url_info',
+    'bing_list_sitemaps', 'bing_sitemap_details',
+)
+
+
+def _package_hashes(package):
+    return {
+        str(path.relative_to(package)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(package.rglob('*'))
+        if path.is_file() and '__pycache__' not in path.parts
+        and not any(part.endswith('.egg-info') for part in path.parts)
+        and path.suffix != '.pyc'
+    }
+
+
+def _child_provenance(environment, executable, *, installed=False, receipt_name='child'):
+    """Select source explicitly, or a noneditable install without source PYTHONPATH.
+
+    Receipts are separate owned files, never stdout/stderr protocol/log evidence.
+    A child records its full package tree and every actually imported module on exit.
+    The parent reads it back against current source bytes even for rejected startup.
+    """
+    import google_seo_mcp
+
+    source = ROOT / 'src/google_seo_mcp'
+    parent_package = Path(google_seo_mcp.__file__).resolve().parent
+    installed = installed or parent_package != source
+    environment = dict(environment)
+    if installed:
+        environment.pop('PYTHONPATH', None)
+        expected_package = None
+    else:
+        environment['PYTHONPATH'] = str(ROOT / 'src')
+        expected_package = str(source)
+    receipt = Path(environment['HOME']) / (receipt_name + '-provenance.json')
+    assert not receipt.exists()
+    # No parent environment or receipt filename is passed through application argv.
+    code = '''
+import atexit
+import hashlib
+import json
+import sys
+from importlib import metadata
+from pathlib import Path
+import google_seo_mcp
+
+_proof_root = Path(google_seo_mcp.__file__).resolve().parent
+_proof_files = {
+    str(p.relative_to(_proof_root)): hashlib.sha256(p.read_bytes()).hexdigest()
+    for p in sorted(_proof_root.rglob('*'))
+    if p.is_file() and '__pycache__' not in p.parts
+    and not any(part.endswith('.egg-info') for part in p.parts) and p.suffix != '.pyc'
+}
+_proof = {'executable': sys.executable, 'prefix': sys.prefix,
+          'package': str(_proof_root), 'files': _proof_files, 'sys_path': sys.path,
+          'pythonpath': __import__('os').environ.get('PYTHONPATH')}
+_proof_dist = metadata.distribution('google-seo-mcp')
+_proof['direct_url'] = json.loads(_proof_dist.read_text('direct_url.json') or '{}')
+_proof['distribution_root'] = str(Path(_proof_dist.locate_file('')).resolve())
+
+def _write_child_proof():
+    _proof['modules'] = {
+        name: str(Path(module.__file__).resolve())
+        for name, module in tuple(sys.modules.items())
+        if (name == 'google_seo_mcp' or name.startswith('google_seo_mcp.'))
+        and getattr(module, '__file__', None)
+    }
+    Path(RECEIPT).write_text(json.dumps(_proof, sort_keys=True))
+
+atexit.register(_write_child_proof)
+'''.replace('RECEIPT', repr(str(receipt)))
+    return environment, code, (receipt, executable, expected_package)
+
+
+def _assert_child_provenance(proof):
+    receipt, executable, expected_package = proof
+    actual = json.loads(receipt.read_text())
+    assert actual['executable'] == executable
+    package = Path(actual['package'])
+    assert actual['files'] == _package_hashes(ROOT / 'src/google_seo_mcp'), (
+        'child package differs from current source; rebuild/install the current wheel', receipt
+    )
+    if expected_package is not None:
+        assert package == Path(expected_package)
+        assert actual['pythonpath'] == str(ROOT / 'src')
+    else:
+        prefix = Path(executable).absolute().parent.parent.resolve()
+        assert Path(actual['prefix']).resolve() == prefix
+        assert prefix in package.parents and ROOT / 'src' not in package.parents
+        assert Path(actual['distribution_root']) == package.parent
+        assert not actual['direct_url'].get('dir_info', {}).get('editable', False)
+        assert actual['pythonpath'] is None
+        assert str(ROOT / 'src') not in actual['sys_path']
+    assert 'google_seo_mcp' in actual['modules']
+    for name, filename in actual['modules'].items():
+        path = Path(filename)
+        assert package in path.parents, (name, path, package)
+        relative = str(path.relative_to(package))
+        assert relative in actual['files'], (name, path)
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == actual['files'][relative]
+    return actual
+
+
 # Install guards before importing the application. Startup/listing must neither
 # listen nor contact providers, even when their credentials are unavailable.
 GUARDED_BOOT = """
@@ -166,16 +274,21 @@ def clean_environment(tmp_path):
 
 
 def run_startup(environment, *, code=None, arguments=()):
-    source = GUARDED_BOOT + (code or "runpy.run_module('google_seo_mcp', run_name='__main__')")
-    return subprocess.run(
+    environment, provenance, proof = _child_provenance(environment, sys.executable)
+    source = GUARDED_BOOT + provenance + (
+        code or "runpy.run_module('google_seo_mcp', run_name='__main__')"
+    )
+    result = subprocess.run(
         [sys.executable, "-c", source, *arguments],
-        cwd=ROOT,
+        cwd=environment['HOME'],
         env=environment,
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
+    _assert_child_provenance(proof)
+    return result
 
 
 @pytest.mark.parametrize(
@@ -327,13 +440,19 @@ def test_real_sdk_stdio_default_exhausts_exact_legacy_catalog(clean_environment)
         # would fail this actual subprocess initialize/list exchange.
         errors = io.StringIO()
         with anyio.fail_after(30):
+            executable = os.environ.get('GOOGLE_SEO_TEST_PYTHON', sys.executable)
+            environment, provenance, proof = _child_provenance(
+                clean_environment, executable,
+                installed='GOOGLE_SEO_TEST_PYTHON' in os.environ, receipt_name='stdio',
+            )
             parameters = StdioServerParameters(
-                command=os.environ.get("GOOGLE_SEO_TEST_PYTHON", sys.executable),
+                command=executable,
                 args=[
-                    "-c", GUARDED_BOOT + "runpy.run_module('google_seo_mcp', run_name='__main__')"
+                    '-c', GUARDED_BOOT + provenance
+                    + "runpy.run_module('google_seo_mcp', run_name='__main__')"
                 ],
-                env=clean_environment,
-                cwd=str(ROOT),
+                env=environment,
+                cwd=clean_environment['HOME'],
             )
             # stdio_client requires a real file descriptor for its stderr sink.
             with open(Path(clean_environment["HOME"]) / "server.stderr", "w+") as stderr:
@@ -354,8 +473,12 @@ def test_real_sdk_stdio_default_exhausts_exact_legacy_catalog(clean_environment)
                         seen.add(cursor)
                 stderr.seek(0)
                 errors.write(stderr.read())
-        assert len(names) == len(set(names)) == 102
-        assert set(names) == set(LEGACY_NAMES)
+        _assert_child_provenance(proof)
+        assert len(LEGACY_NAMES) == len(set(LEGACY_NAMES)) == 102
+        assert len(BING_NAMES) == len(set(BING_NAMES)) == 11
+        assert not set(LEGACY_NAMES) & set(BING_NAMES)
+        assert len(names) == len(set(names)) == 113
+        assert set(names) == set(LEGACY_NAMES) | set(BING_NAMES)
         assert "PROVIDER_OR_LISTENER_ATTEMPT" not in errors.getvalue()
         assert "Failed to parse JSONRPC" not in errors.getvalue()
 
