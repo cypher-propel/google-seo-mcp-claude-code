@@ -53,8 +53,21 @@ def runtime_cleanup_guard():
     assert uninstall[4] == "--yes"
     assert set(uninstall[5:]) == BOOTSTRAP_PACKAGES, "remove all four global packages"
     assert len(uninstall[5:]) == len(BOOTSTRAP_PACKAGES)
-    assert command_index + 1 < len(commands), "chain the guard immediately after uninstall"
-    guard = commands[command_index + 1]
+    assert all(not (set(token) <= set(";&|"))
+               for command in commands for token in command), "use only success-only chaining"
+    assert command_index + 2 < len(commands), "chain removal and guard immediately after uninstall"
+    removal = commands[command_index + 1]
+    assert len(removal) == 3 and removal[:2] == ["python", "-c"], (
+        "remove ensurepip with global Python"
+    )
+    expected_removal = ast.parse(
+        'from pathlib import Path; import shutil,sysconfig; '
+        'shutil.rmtree(Path(sysconfig.get_path("stdlib"))/"ensurepip")'
+    )
+    assert ast.dump(ast.parse(removal[2])) == ast.dump(expected_removal), (
+        "require exactly the accepted stdlib ensurepip removal"
+    )
+    guard = commands[command_index + 2]
     assert len(guard) == 3 and guard[:2] == ["python", "-c"], "use global Python"
     tree = ast.parse(guard[2])
     assert any(isinstance(node, ast.ImportFrom) and node.module == "importlib.metadata"
@@ -62,7 +75,7 @@ def runtime_cleanup_guard():
     assert any(isinstance(node, ast.Assert) for node in ast.walk(tree)), "require an assertion"
     before_guard = "\n".join(argument for _, argument in instructions[:index])
     before_guard += "\n" + "\n".join(" ".join(command)
-                                        for command in commands[:command_index + 1])
+                                        for command in commands[:command_index + 2])
     assert "/opt/venv" not in before_guard, "cleanup must precede venv selection or COPY"
     assert "PYTHONOPTIMIZE" not in before_guard, "the assertion must remain enabled"
     after_guard = instructions[index + 1:]
@@ -104,13 +117,25 @@ def test_extracted_global_guard_requires_no_distributions(tmp_path, names):
         "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     }
-    # Redirect only discovery's search root. Real stdlib distribution metadata is
-    # used, and the extracted production assertion executes unchanged.
+    # Synthetic removed-module profile, NOT actual image execution or removal.
+    # Redirect metadata's search root only: real stdlib discovery stays unchanged.
+    # Model the five removed modules independently of host ensurepip availability;
+    # all other module lookups delegate to the real finder. Run the guard unchanged.
     harness = """
 import importlib.metadata as metadata
+import importlib.util as util
+from importlib.machinery import ModuleSpec
 import sys
 discover = metadata.distributions
 metadata.distributions = lambda: discover(path=[sys.argv[2]])
+find_spec = util.find_spec
+removed = {'pip', 'ensurepip', 'setuptools', 'wheel', 'packaging'}
+present = sys.argv[3] if len(sys.argv) > 3 else None
+def controlled_find_spec(name, package=None):
+    if name in removed:
+        return ModuleSpec(name, loader=None) if name == present else None
+    return find_spec(name, package)
+util.find_spec = controlled_find_spec
 exec(compile(sys.argv[1], '<Dockerfile global cleanup>', 'exec'))
 """
     result = subprocess.run(
@@ -121,6 +146,17 @@ exec(compile(sys.argv[1], '<Dockerfile global cleanup>', 'exec'))
     if not names:
         assert result.returncode == 0, result.stderr
         assert result.stderr == ""
+        # Empty real metadata must not let any one remaining module pass.
+        # ModuleSpec emulates presence without installing a package on the host.
+        for module in ("pip", "ensurepip", "setuptools", "wheel", "packaging"):
+            present_result = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", harness, guard,
+                 str(metadata_path), module],
+                env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=10,
+            )
+            assert present_result.stdout == ""
+            assert present_result.returncode != 0, f"global module {module} unexpectedly accepted"
+            assert "AssertionError" in present_result.stderr, present_result.stderr
     else:
         assert result.returncode != 0, "global distribution unexpectedly accepted"
         assert "AssertionError" in result.stderr, result.stderr
