@@ -6,6 +6,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 Count = Annotated[int, Field(strict=True, ge=0)]
+RawPosition = Annotated[int, Field(strict=True, ge=-2147483648, le=2147483647)]
 WireText = Annotated[str, StringConstraints(strict=True, max_length=2048)]
 RawDate = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=128)]
 
@@ -44,8 +45,8 @@ class RawBingTrafficStats(BingWireModel):
 
 class RawBingQueryStats(RawBingTrafficStats):
     query: WireText = Field(alias="Query")
-    avg_click_position: Count = Field(alias="AvgClickPosition")
-    avg_impression_position: Count = Field(alias="AvgImpressionPosition")
+    avg_click_position: RawPosition = Field(alias="AvgClickPosition")
+    avg_impression_position: RawPosition = Field(alias="AvgImpressionPosition")
 
 
 class RawBingCrawlStats(BingWireModel):
