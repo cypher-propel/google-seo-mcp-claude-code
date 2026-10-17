@@ -107,13 +107,93 @@ assert set(names) == expected
 
 
 def test_container_source_security_contract_without_claiming_image_execution():
+    import ast
+    import shlex
+
     docker = (ROOT / "Dockerfile").read_text()
     images = re.findall(r"^FROM (\S+)", docker, re.MULTILINE)
     assert len(images) == 2 and len(set(images)) == 1
     assert re.fullmatch(r"python:3\.11-slim-bookworm@sha256:[0-9a-f]{64}", images[0])
     for required in ("--require-hashes", "--no-deps", "USER 10001:10001", "STOPSIGNAL SIGTERM",
-                     "production_tools.json", "--without-pip", "pip check"):
+                     "--without-pip"):
         assert required in docker
+
+    # Inspect executable builder instructions, not comments or the runtime stage.
+    instructions = [line.strip() for line in docker.replace("\\\n", " ").splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+    stages = [i for i, line in enumerate(instructions) if line.startswith("FROM ")]
+    builder = instructions[stages[0] + 1:stages[1]]
+    assert instructions[stages[0]].endswith(" AS wheel-builder")
+    assert "WORKDIR /build" in builder
+    assert "COPY src/ ./src/" in builder
+    commands = [shlex.split(command) for line in builder if line.startswith("RUN ")
+                for command in line[4:].split(" && ")]
+    assert ["python", "-m", "venv", "--without-pip", "/opt/venv"] in commands
+    assert ["python", "-m", "pip", "--python", "/opt/venv/bin/python", "check"] in commands
+    programs = [ast.parse(command[2]) for command in commands
+                if command[:2] == ["python", "-c"] and len(command) == 3]
+    guarded = [program for program in programs if any(
+        isinstance(node, ast.Assert) and ast.dump(node.test) == ast.dump(
+            ast.parse("members == source", mode="eval").body)
+        for node in program.body)]
+    assert len(guarded) == 1
+    program = guarded[0]
+    assignments = {node.targets[0].id: node for node in program.body
+                   if isinstance(node, ast.Assign) and len(node.targets) == 1
+                   and isinstance(node.targets[0], ast.Name)}
+    # Pin the actual data-flow: archive bytes and all copied source/data bytes,
+    # including JSON, feed the same equality assertion with no suffix whitelist.
+    expected = {
+        "p": 'Path("google_seo_mcp-0.8.5-py3-none-any.whl")',
+        "z": 'zipfile.ZipFile(p)',
+        "members": '{n:z.read(n) for n in z.namelist() '
+                   'if n.startswith("google_seo_mcp/") and not n.endswith("/")}',
+        "source": '{p.relative_to("src").as_posix():p.read_bytes() '
+                  'for p in Path("src/google_seo_mcp").rglob("*") '
+                  'if p.is_file() and "__pycache__" not in p.parts '
+                  'and p.suffix not in {".pyc",".pyo"}}',
+    }
+    for name, expression in expected.items():
+        assert ast.dump(assignments[name].value) == ast.dump(
+            ast.parse(expression, mode="eval").body)
+    archive_name = ast.literal_eval(assignments["p"].value.args[0])
+    assert f"COPY deploy/image-build/{archive_name} ./" in builder
+    import zipfile
+
+    # Do not demand full current-wire equality with the inherited qualified wheel:
+    # the parent binds the fresh candidate later. Exercise the actual catalog bytes.
+    with zipfile.ZipFile(ROOT / "deploy/image-build" / archive_name) as archive, \
+            pytest.MonkeyPatch.context() as context:
+        context.chdir(ROOT)
+        namespace = {"z": archive, "Path": Path}
+        for name in ("members", "source"):
+            exec(compile(ast.Module(body=[assignments[name]], type_ignores=[]),
+                         "<Dockerfile source/data mapping>", "exec"), namespace)
+        counts = [node for node in program.body if isinstance(node, ast.Assert)
+                  and ast.dump(node.test) == ast.dump(ast.parse(
+                      "len(z.namelist()) == 83 and len(members) == 77", mode="eval").body)]
+        assert len(counts) == 1
+        exec(compile(ast.Module(body=counts, type_ignores=[]),
+                     "<Dockerfile archive counts>", "exec"), namespace)
+        catalog = "google_seo_mcp/production_tools.json"
+        assert catalog in namespace["members"] and catalog in namespace["source"]
+        assert namespace["members"][catalog] == namespace["source"][catalog]
+        guard = next(node for node in program.body if isinstance(node, ast.Assert)
+                     and ast.dump(node.test) == ast.dump(
+                         ast.parse("members == source", mode="eval").body))
+        # Require the guard after both mappings; an earlier/dead guard is not coverage.
+        assert program.body.index(guard) > max(program.body.index(assignments[name])
+                                               for name in ("members", "source"))
+        check = compile(ast.Module(body=[guard], type_ignores=[]),
+                        "<Dockerfile source/data equality>", "exec")
+        member = {catalog: namespace["members"][catalog]}
+        source = {catalog: namespace["source"][catalog]}
+        exec(check, {"members": member, "source": source})
+        for bad_members, bad_source in (({}, source), (member, {}),
+                                        ({catalog: member[catalog] + b"!"}, source),
+                                        (member, {catalog: source[catalog] + b"!"})):
+            with pytest.raises(AssertionError):
+                exec(check, {"members": bad_members, "source": bad_source})
     assert "COPY --from=wheel-builder /opt/venv /opt/venv" in docker
     assert not re.search(r"pip install .*\[(?:dev|crawl|ssr|stats)\]", docker)
     compose = (ROOT / "docker-compose.yml").read_text()
