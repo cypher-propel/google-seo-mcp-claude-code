@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from google_seo_mcp.bing import client as boundary
-from google_seo_mcp.bing.auth import BingAuthError, configure_bing_auth
+from google_seo_mcp.bing.auth import BingAuthError, BingCredentialLoader, configure_bing_auth
 from google_seo_mcp.bing.client import BingClientError, BingReadClient
 from google_seo_mcp.bing.models import BingCredentialDocument, BingOperation, BingToolRequest
 
@@ -56,26 +56,19 @@ CASES = [
 ]
 
 
-class Loader:
+class Loader(BingCredentialLoader):
+    """Count calls while inheriting real key-only generation/custody admission."""
     def __init__(self):
+        super().__init__()
         self.loads = 0
-        self.authorized = []
         self.fail = None
+        self.actual = self
 
     def load(self):
         self.loads += 1
         if self.fail:
             raise BingAuthError(self.fail)
-        return BingCredentialDocument(version=1, api_key=KEY)
-
-    @property
-    def allowed_sites(self):
-        return frozenset({SITE})
-
-    def authorize_site(self, site):
-        self.authorized.append(site)
-        if site != SITE:
-            raise BingAuthError("site_denied")
+        return super().load()
 
 
 class Clock:
@@ -92,12 +85,24 @@ class Clock:
 
 
 @pytest.fixture(autouse=True)
-def offline(monkeypatch):
+def offline(monkeypatch, tmp_path):
+    # Synthetic protected custody; no real credentials or provider network.
+    tmp_path.chmod(0o700)
+    key = tmp_path / "key.json"
+    key.write_text(json.dumps({"version": 1, "api_key": KEY}))
+    key.chmod(0o600)
+    configure_bing_auth(SimpleNamespace(bing_credentials_file=key))
+    attempts = []
     def deny(*args, **kwargs):
-        pytest.fail("unexpected real network")
+        attempts.append(True)
+        raise RuntimeError("forbidden_network")
     monkeypatch.setattr(socket, "getaddrinfo", deny)
     monkeypatch.setattr(socket.socket, "connect", deny)
+    monkeypatch.setattr(socket.socket, "connect_ex", deny)
+    monkeypatch.setattr(socket, "create_connection", deny)
     monkeypatch.setattr(boundary, "_GLOBAL", boundary._Admission())
+    yield
+    assert attempts == []
 
 
 def request(op="GetQueryStats", **kwargs):
@@ -105,14 +110,17 @@ def request(op="GetQueryStats", **kwargs):
                            **({} if op == "GetUserSites" else {"site_url": SITE}), **kwargs)
 
 
-def make(payload=None, *, status=200, handler=None, loader=None, clock=None, **kwargs):
+def make(payload=None, *, status=200, handler=None, loader=None, clock=None,
+         discovery=True, **kwargs):
     seen = []
     def upstream(req):
         seen.append(req)
+        if discovery and req.url.path.endswith("/GetUserSites"):
+            return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]})
         return handler(req) if handler else httpx.Response(status, json=payload)
     clock = clock or Clock()
     return (BingReadClient(loader or Loader(), transport=httpx.MockTransport(upstream),
-                           clock=clock, sleep=clock.sleep, jitter=lambda: 0, **kwargs), seen)
+                           clock=clock, **kwargs), seen)
 
 
 @pytest.mark.parametrize("op,inputs,params,rows,kind", CASES)
@@ -122,8 +130,11 @@ def test_exact_get_operation_params(op, inputs, params, rows, kind):
     result = client.read(BingOperation(op), req)
     assert result.status == "ok"
     assert [row.kind for row in result.records] == [kind]
-    assert len(seen) == 1
-    sent = seen[0]
+    assert len(seen) == (1 if op == "GetUserSites" else 2)
+    if op != "GetUserSites":
+        assert seen[0].url.path.endswith("/GetUserSites")
+        assert set(seen[0].url.params) == {"apikey"}
+    sent = seen[-1]
     assert sent.method == "GET"
     assert sent.url.scheme == "https" and sent.url.host == "ssl.bing.com"
     assert sent.url.port in (None, 443)
@@ -145,10 +156,10 @@ def test_exact_get_operation_params(op, inputs, params, rows, kind):
 
 @pytest.mark.parametrize("op,inputs,params,rows,kind", CASES)
 def test_every_operation_empty_vs_null(op, inputs, params, rows, kind):
-    client, _ = make({"d": []})
+    client, _ = make({"d": []}, discovery=(op != "GetUserSites"))
     result = client.read(BingOperation(op), request(op, **inputs))
     assert result.status == ("provider_error" if kind == "url_info" else "empty")
-    client, _ = make({"d": None})
+    client, _ = make({"d": None}, discovery=(op != "GetUserSites"))
     result = client.read(BingOperation(op), request(op, **inputs))
     assert result.status == "provider_error"
 
@@ -160,7 +171,7 @@ def test_d_empty_distinct_from_null_fault_malformed(payload):
     result = client.read(BingOperation.GET_QUERY_STATS, request())
     assert result.status == "provider_error"
     assert result.error.code == "invalid_response"
-    assert len(seen) == 1
+    assert len(seen) == 2
     assert result.provider_cadence == "weekly"
     assert result.provider_completeness == "unknown"
 
@@ -188,7 +199,7 @@ def test_http400_invalid_api_key_and_http200_faults(status, payload):
     assert result.status == ("denied" if status in (401, 403) else "provider_error")
     assert result.error.code == ("access_denied" if status in (401, 403) else "provider_error")
     assert "foreign" not in result.model_dump_json()
-    assert len(seen) == 1  # no undocumented ErrorCode semantics, no auth retry
+    assert len(seen) == 2  # no undocumented ErrorCode semantics, no auth retry
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -196,7 +207,7 @@ def test_redirects_never_follow(status):
     client, seen = make(handler=lambda req: httpx.Response(
         status, headers={"Location": "https://attacker.net/?apikey=" + quote(KEY)}))
     result = client.read(BingOperation.GET_QUERY_STATS, request())
-    assert result.status == "provider_error" and len(seen) == 1
+    assert result.error.code == "credential_reflection" and len(seen) == 2
 
 
 @pytest.mark.parametrize("status", [429, 502, 503, 504])
@@ -206,14 +217,14 @@ def test_retry_after_budget_and_deadline(status, after, expected):
     client, seen = make(handler=lambda req: httpx.Response(status, headers={"Retry-After": after}),
                         clock=clock)
     result = client.read(BingOperation.GET_QUERY_STATS, request())
-    assert len(seen) == 2 and clock.sleeps == [expected]
+    assert len(seen) == 2 and clock.sleeps == []
     assert result.error.code == ("rate_limited" if status == 429 else "provider_error")
 
 
 @pytest.mark.parametrize("error,retries,code", [
-    (httpx.ConnectError, 2, "transport_error"), (httpx.ConnectTimeout, 2, "transport_error"),
-    (httpx.ReadTimeout, 1, "timeout"), (httpx.ReadError, 1, "transport_error"),
-    (httpx.RemoteProtocolError, 1, "transport_error"),
+    (httpx.ConnectError, 2, "transport_error"), (httpx.ConnectTimeout, 2, "timeout"),
+    (httpx.ReadTimeout, 2, "timeout"), (httpx.ReadError, 2, "transport_error"),
+    (httpx.RemoteProtocolError, 2, "transport_error"),
 ])
 def test_only_transient_connect_errors_retry(error, retries, code):
     def upstream(req):
@@ -228,22 +239,20 @@ def test_only_transient_connect_errors_retry(error, retries, code):
 def test_other_http_failures_never_retry(status):
     client, seen = make({"d": []}, status=status)
     assert client.read(BingOperation.GET_QUERY_STATS, request()).status == "provider_error"
-    assert len(seen) == 1
+    assert len(seen) == 2
 
 
 def test_retry_success_and_every_attempt_reauthorizes():
     loader = Loader()
-    count = 0
-    def upstream(req):
-        nonlocal count
-        count += 1
-        return httpx.Response(503) if count == 1 else httpx.Response(200, json={"d": [QUERY]})
-    client, seen = make(handler=upstream, loader=loader)
+    client, seen = make({"d": [QUERY]}, loader=loader)
     assert client.read(BingOperation.GET_QUERY_STATS, request()).status == "ok"
-    assert len(seen) == 2 and loader.loads == 3 and loader.authorized == [SITE] * 3
+    assert [r.url.path.rsplit("/", 1)[-1] for r in seen] == ["GetUserSites", "GetQueryStats"]
+    # Every transition rechecks actual custody; failure never enters wire.
+    loads = loader.loads
+    assert loads == 13
     loader.fail = "credentials_invalid"
     assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "credentials_invalid"
-    assert len(seen) == 2
+    assert loader.loads == loads + 1 and len(seen) == 2
 
 
 def test_missing_config_precedes_dns_and_client_creation(monkeypatch):
@@ -292,7 +301,7 @@ def test_operation_disagreement_and_site_authorization_before_io():
     assert result.error.code == "invalid_request" and loader.loads == 0
     other = BingToolRequest(operation=BingOperation.GET_QUERY_STATS, site_url="https://bing.com/")
     assert client.read(other.operation, other).error.code == "site_denied"
-    assert not seen
+    assert len(seen) == 1 and seen[0].url.path.endswith("/GetUserSites")
 
 
 @pytest.mark.parametrize("variant", [KEY, quote(KEY, safe=""), quote(quote(KEY, safe=""), safe=""),
@@ -312,7 +321,7 @@ def test_bounded_body_and_raw_decoded_key_reflection(variant, location):
     payload = {"d": [row]} if location != "fault" else {"ErrorCode": 2, "Message": variant}
     client, seen = make(payload)
     result = client.read(BingOperation.GET_QUERY_STATS, request())
-    assert result.error.code == "credential_reflection" and len(seen) == 1
+    assert result.error.code == "credential_reflection" and len(seen) == 2
     assert not result.records and KEY not in result.model_dump_json()
 
 
@@ -333,7 +342,7 @@ def test_decompressed_stream_body_cap(compressed):
                               stream=Chunks([data[i:i + 1024] for i in range(0, len(data), 1024)]))
     client, seen = make(handler=upstream)
     assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "response_too_large"
-    assert len(seen) == 1
+    assert len(seen) == 2
 
 
 def test_partial_all_invalid_and_local_window_limit_preserve_diagnostics():
@@ -347,17 +356,22 @@ def test_partial_all_invalid_and_local_window_limit_preserve_diagnostics():
     assert result.observed_period.start_date.isoformat() == "2024-01-01"
     assert {"invalid_rows_dropped", "invalid_dates_dropped", "local_limit", "weekly_buckets",
             "window_not_exact", "provider_completeness_unknown"} <= set(result.warnings)
-    assert set(seen[0].url.params) == {"apikey", "siteUrl"}
+    assert set(seen[-1].url.params) == {"apikey", "siteUrl"}
 
 
 def test_discovery_only_approved_verified_and_codes_stripped():
-    rows = [{"Url": SITE, "IsVerified": True, "AuthenticationCode": "private-code"},
-            {"Url": "https://bing.com/", "IsVerified": True},
-            {"Url": SITE, "IsVerified": False}]
-    client, _ = make({"d": rows})
+    rows = [{"Url": SITE, "IsVerified": True, "AuthenticationCode": "discard-code"},
+            {"Url": "https://bing.com/", "IsVerified": False},
+            {"Url": "https://new-public.com/", "IsVerified": True},
+            {"Url": SITE, "IsVerified": True}]
+    client, seen = make({"d": rows}, discovery=False)
     result = client.read(BingOperation.GET_USER_SITES, request("GetUserSites"))
-    assert result.source_rows == 3 and result.returned_rows == 1
-    assert result.records[0].url == SITE and "private-code" not in result.model_dump_json()
+    assert result.status == "ok"
+    assert (result.source_rows, result.returned_rows, result.dropped_rows) == (4, 3, 0)
+    assert [(r.url, r.is_verified) for r in result.records] == [
+        ("https://bing.com/", False), (SITE, True), ("https://new-public.com/", True)]
+    assert "discard-code" not in result.model_dump_json()
+    assert result.provider_completeness == "unknown" and len(seen) == 1
 
 
 def test_fixed_httpx_constructor_flags_and_logger_constructor_privacy(monkeypatch, caplog):
@@ -384,16 +398,16 @@ def test_fixed_httpx_constructor_flags_and_logger_constructor_privacy(monkeypatc
 
 
 def test_global_rate_budget_includes_retries_and_new_instances():
-    seen = []
-    def handler(req):
-        seen.append(req)
-        return httpx.Response(503)
+    sends = []
     for _ in range(6):
-        client, _ = make(handler=handler)
+        client, seen = make(status=503)
         assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "provider_error"
-    client, _ = make(handler=handler)
+        sends.extend(r.url.path.rsplit("/", 1)[-1] for r in seen)
+    client, seen = make(status=503)
     result = client.read(BingOperation.GET_QUERY_STATS, request())
-    assert result.error.code == "rate_limited" and len(seen) == 12
+    assert result.error.code == "rate_limited" and seen == []
+    assert sends == ["GetUserSites", "GetQueryStats"] * 6
+    assert len(boundary._GLOBAL.attempts) == 12
 
 
 def test_midstream_delay_is_per_attempt_total_not_per_chunk():
@@ -405,38 +419,50 @@ def test_midstream_delay_is_per_attempt_total_not_per_chunk():
                 yield b" " * 8192
     client, seen = make(handler=lambda req: httpx.Response(200, stream=Slow()), clock=clock)
     assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "timeout"
-    assert len(seen) == 1 and clock.value == 16
+    assert len(seen) == 2 and clock.value == 16
 
 
-def test_deadline_includes_retry_sleep_and_stops_second_attempt():
+def test_deadline_includes_retry_sleep_and_stops_second_attempt(monkeypatch):
+    # No retry/sleep exists. Discovery and business MUST share the same budget.
     clock = Clock()
-    def oversleep(seconds):
-        clock.value += 61
-    client, seen = make(status=503, clock=clock)
-    client._sleep = oversleep
+    original = boundary._Budget
+    class Budget(original):
+        def __init__(self, clock):
+            super().__init__(clock)
+            self.end = clock() + 10
+    monkeypatch.setattr(boundary, "_Budget", Budget)
+    def upstream(req):
+        clock.value += 11
+        return httpx.Response(503)
+    client, seen = make(handler=upstream, clock=clock, discovery=False)
     result = client.read(BingOperation.GET_QUERY_STATS, request())
     assert result.error.code == "timeout" and len(seen) == 1
+    assert clock.sleeps == []
 
 
 def test_concurrency_global_across_instances_and_retries():
-    state = {"active": 0, "peak": 0, "count": 0}
+    state = {"active": 0, "peak": 0, "count": 0, "business": 0}
     lock = threading.Lock()
     def upstream(req):
+        discovery = req.url.path.endswith("/GetUserSites")
         with lock:
             state["active"] += 1
             state["peak"] = max(state["peak"], state["active"])
             state["count"] += 1
-            number = state["count"]
+            if not discovery:
+                state["business"] += 1
+            number = state["business"]
         time.sleep(0.005)
         with lock:
             state["active"] -= 1
-        return httpx.Response(503 if number == 1 else 200, json={"d": []})
-    clients = [make(handler=upstream)[0] for _ in range(4)]
+        return httpx.Response(200 if discovery or number != 1 else 503,
+            json={"d": [{"Url": SITE, "IsVerified": True}] if discovery else []})
+    clients = [make(handler=upstream, discovery=False)[0] for _ in range(4)]
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(
             lambda c: c.read(BingOperation.GET_QUERY_STATS, request()), clients))
-    assert all(r.status == "empty" for r in results)
-    assert state["peak"] == 1 and state["count"] == 5
+    assert sorted(r.status for r in results) == ["empty", "empty", "empty", "provider_error"]
+    assert state == {"active": 0, "peak": 1, "count": 8, "business": 4}
 
 
 def test_concurrency_wait_consumes_deadline_and_rechecks_authorization(monkeypatch):
@@ -482,7 +508,7 @@ def test_stalled_stream_real_watchdog_retains_slot(monkeypatch):
         monkeypatch.setattr(boundary, "_Budget", ShortBudget)
         other, other_seen = make({"d": []})
         assert other.read(BingOperation.GET_QUERY_STATS, request()).error.code == "timeout"
-        assert not other_seen and len(seen) == 1
+        assert not other_seen and len(seen) == 2
     finally:
         release.set()
         assert closed.wait(1)
@@ -527,7 +553,7 @@ def test_additional_escaped_reflection_is_closed_error(variant):
     assert result.error.code == "credential_reflection"
 
 
-@pytest.mark.parametrize("stage", ["constructor", "stream", "close", "sleep", "loader"])
+@pytest.mark.parametrize("stage", ["constructor", "stream", "close", "send_hook", "loader"])
 def test_direct_exception_paths_never_log_or_expose_foreign_context(
         stage, monkeypatch, caplog, capsys):
     caplog.set_level(logging.DEBUG)
@@ -540,9 +566,11 @@ def test_direct_exception_paths_never_log_or_expose_foreign_context(
         monkeypatch.setattr(httpx, "Client", fail)
     elif stage == "loader":
         loader.load = fail
-    elif stage == "sleep":
-        client, seen = make(status=503)
-        client._sleep = fail
+    elif stage == "send_hook":
+        original = httpx.Client
+        def factory(**kwargs):
+            return original(**kwargs, event_hooks={"request": [fail]})
+        monkeypatch.setattr(httpx, "Client", factory)
     else:
         class Exploding(httpx.SyncByteStream):
             def __iter__(self):
@@ -558,7 +586,8 @@ def test_direct_exception_paths_never_log_or_expose_foreign_context(
     assert "raw-error" not in result.model_dump_json()
     assert KEY not in result.model_dump_json()
     assert not caplog.records and KEY not in capsys.readouterr().err
-    assert len(seen) <= 1
+    assert len(seen) == (2 if stage in ("stream", "close") else 0)
+    assert result.error.code == "transport_error"
 
 
 def test_no_logrecord_is_constructed_in_private_boundary(monkeypatch):
@@ -605,8 +634,8 @@ def test_loader_revocation_during_retry_and_concurrency_wait(monkeypatch):
     loader = Loader()
     def upstream(req):
         loader.fail = "credentials_invalid"
-        return httpx.Response(503)
-    client, seen = make(handler=upstream, loader=loader)
+        return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]})
+    client, seen = make(handler=upstream, loader=loader, discovery=False)
     assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "credentials_invalid"
     assert len(seen) == 1
     loader.fail = None
@@ -635,12 +664,13 @@ def test_actual_auth_loader_rotation_denies_real_client_reuse(tmp_path):
     seen = []
     def upstream(req):
         seen.append(req)
-        return httpx.Response(200, json={"d": []})
+        return httpx.Response(200, json={"d": ([{"Url": SITE, "IsVerified": True}]
+            if req.url.path.endswith("/GetUserSites") else [])})
     client = BingReadClient(transport=httpx.MockTransport(upstream))
     assert client.read(BingOperation.GET_QUERY_STATS, request()).status == "empty"
     key.write_text(json.dumps({"version": 1, "api_key": "synthetic-rotated"}))
     assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "credentials_invalid"
-    assert len(seen) == 1
+    assert len(seen) == 2
     configure_bing_auth(SimpleNamespace(bing_credentials_file=None, bing_sites_file=None))
 
 
@@ -656,7 +686,7 @@ def test_rate_budget_expires_but_client_clock_cannot_reset_it():
         boundary._GLOBAL.attempts = boundary.deque(t - 61 for t in boundary._GLOBAL.attempts)
     client, seen2 = make({"d": []})
     assert client.read(BingOperation.GET_QUERY_STATS, request()).status == "empty"
-    assert len(seen2) == 1
+    assert len(seen2) == 2
 
 
 def test_stream_exact_body_cap_is_admitted():
@@ -669,14 +699,11 @@ def test_stream_exact_body_cap_is_admitted():
 def test_httpdate_retry_after_bounded_and_jitter_clamped():
     client, seen = make(handler=lambda req: httpx.Response(
         503, headers={"Retry-After": "Thu, 01 Jan 2099 00:00:00 GMT"}))
-    clock = client._clock
-    assert client.read(BingOperation.GET_QUERY_STATS, request()).status == "provider_error"
-    assert len(seen) == 2 and clock.sleeps == [5.0]
-    client, seen = make(status=503)
-    client._jitter = lambda: 999999
-    clock = client._clock
-    assert client.read(BingOperation.GET_QUERY_STATS, request()).status == "provider_error"
-    assert clock.sleeps == [1.5] and len(seen) == 2
+    assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "provider_error"
+    assert len(seen) == 2 and client._clock.sleeps == []
+    for forbidden in ("sleep", "jitter"):
+        with pytest.raises(TypeError):
+            BingReadClient(**{forbidden: lambda *a: pytest.fail("retired_callback")})
 
 
 def test_total_deadline_supervises_slow_loader_without_late_network(monkeypatch):
@@ -734,7 +761,7 @@ def test_no_arbitrary_key_endpoint_or_method_constructor(forbidden):
 def test_qualification_composition_can_disable_all_http_retries(status):
     client, seen = make(status=status, max_retries=0)
     result = client.read(BingOperation.GET_QUERY_STATS, request())
-    assert result.status == "provider_error" and len(seen) == 1
+    assert result.status == "provider_error" and len(seen) == 2
     assert not client._clock.sleeps
 
 
@@ -743,10 +770,10 @@ def test_qualification_composition_disables_transient_connect_retry():
         raise httpx.ConnectError("synthetic-connect-failure", request=req)
     client, seen = make(handler=upstream, max_retries=0)
     assert client.read(BingOperation.GET_QUERY_STATS, request()).error.code == "transport_error"
-    assert len(seen) == 1 and not client._clock.sleeps
+    assert len(seen) == 2 and not client._clock.sleeps
 
 
-@pytest.mark.parametrize("value", [True, False, -1, 2, 1.0, "0", None])
+@pytest.mark.parametrize("value", [True, False, -1, 1, 2, 1.0, "0", None])
 def test_retry_composition_cannot_expand_the_accepted_bound(value):
     with pytest.raises(BingClientError, match="^invalid_request$"):
         BingReadClient(max_retries=value)
@@ -951,11 +978,14 @@ def test_every_failure_has_input_free_provenance(stage, code, monkeypatch):
     assert "2025-03-05" not in text and SITE not in text and KEY not in text
     assert not result.records and result.provider_cadence == "weekly"
     assert {"weekly_buckets", "utc_date_filter", "window_not_exact"} <= set(result.warnings)
-    if stage in ("missing", "invalid", "denied", "mismatch", "local", "busy", "timeout", "rate"):
+    if stage in ("missing", "invalid", "mismatch", "local", "busy", "timeout", "rate"):
         assert not seen
     if stage == "mismatch":
         assert loader.loads == 0
-    if stage in ("missing", "invalid", "denied"):
+    if stage == "denied":
+        assert len(seen) == 1 and seen[0].url.path.endswith("/GetUserSites")
+        assert loader.loads == 7
+    if stage in ("missing", "invalid"):
         assert loader.loads == 1  # No credential read added for sanitization.
     if stage == "rows":
         assert result.source_rows == result.dropped_rows == 1
@@ -968,7 +998,7 @@ def test_all_operations_failure_context_is_empty(op, inputs, params, rows, kind,
     if failure == "missing":
         loader.fail = "credentials_missing"
     payload = {"d": {} if kind == "url_info" else [{}]}
-    client, seen = make(payload, loader=loader, max_retries=0)
+    client, seen = make(payload, loader=loader, max_retries=0, discovery=(op != "GetUserSites"))
     req = request(op, **inputs)
     result = client.read(req.operation, req)
     assert result.error.code == ("provider_not_configured" if failure == "missing"
@@ -977,7 +1007,7 @@ def test_all_operations_failure_context_is_empty(op, inputs, params, rows, kind,
     assert result.requested_period is None and result.observed_period is None
     assert not result.records
     assert SITE not in result.model_dump_json()
-    assert len(seen) == (0 if failure == "missing" else 1)
+    assert len(seen) == (0 if failure == "missing" else (1 if op == "GetUserSites" else 2))
 
 
 @pytest.mark.parametrize("stage", ["clock", "worker", "unchecked", "operation"])
@@ -993,10 +1023,16 @@ def test_static_exception_exits_never_carry_request_context(stage):
         client._read = fail
     elif stage == "unchecked":
         req = req.model_copy(update={"site_url": "caller-marker"})
-    with pytest.raises(BingClientError) as caught:
-        client.read("caller-marker" if stage == "operation" else req.operation, req)
-    assert str(caught.value) == "invalid_request"
-    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    if stage == "worker":
+        result = client.read(req.operation, req)
+        assert result.error.code == "transport_error"
+        assert "caller-marker" not in result.model_dump_json()
+        assert result.site_url == "" and result.requested_period is None
+    else:
+        with pytest.raises(BingClientError) as caught:
+            client.read("caller-marker" if stage == "operation" else req.operation, req)
+        assert str(caught.value) == "invalid_request"
+        assert caught.value.__context__ is None and caught.value.__cause__ is None
     assert not seen and loader.loads == 0
 
 
@@ -1008,7 +1044,9 @@ def test_dispatch_gate_cancel_linearization_and_live_control():
     def handler(req):
         calls.append(req)
         return httpx.Response(200, json={"d": []})
-    transport = boundary._GatedTransport(httpx.MockTransport(handler), gate)
+    loader = Loader()
+    transport = boundary._GatedTransport(
+        httpx.MockTransport(handler), gate, loader, loader.actual._boundary.generation)
     req = httpx.Request("GET", "https://ssl.bing.com/")
     assert transport.handle_request(req).status_code == 200
     gate.cancel()
@@ -1018,5 +1056,439 @@ def test_dispatch_gate_cancel_linearization_and_live_control():
     other = boundary._Attempt(budget, 15)
     budget.cancel()
     with pytest.raises(boundary._Stop):
-        boundary._GatedTransport(httpx.MockTransport(handler), other).handle_request(req)
+        boundary._GatedTransport(
+            httpx.MockTransport(handler), other, loader,
+            loader.actual._boundary.generation).handle_request(req)
     assert len(calls) == 1
+
+
+# Permanent offline integration regressions, appended by the owned migration.
+@pytest.mark.parametrize("op,inputs,params,rows,kind", CASES[1:])
+@pytest.mark.parametrize("membership", [
+    "true", "false", "absent", "unknown", "conflict", "partial"])
+def test_every_property_path_real_custody_fresh_union_admission(
+    op, inputs, params, rows, kind, membership,
+):
+    site = "https://new-agency-public.com/"
+    selectors = {name: value.replace(SITE, site) for name, value in inputs.items()}
+    req = BingToolRequest(operation=BingOperation(op), site_url=site, **selectors)
+    listed = [{"Url": SITE, "IsVerified": True},
+              {"Url": "https://visible-unverified.com/", "IsVerified": False}]
+    if membership != "absent":
+        listed.append({"Url": site, "IsVerified": membership != "false"})
+    if membership == "unknown":
+        listed[-1]["IsVerified"] = "true"
+    elif membership == "conflict":
+        listed.append({"Url": site, "IsVerified": False})
+    elif membership == "partial":
+        listed.append({"Url": "not-a-public-property", "IsVerified": True})
+    def handler(wire):
+        assert wire.method == "GET" and wire.url.host == "ssl.bing.com"
+        if wire.url.path.endswith("/GetUserSites"):
+            assert set(wire.url.params) == {"apikey"}
+            return httpx.Response(200, json={"d": listed})
+        assert wire.url.path.endswith("/" + op)
+        assert wire.url.params["siteUrl"] == site
+        return httpx.Response(200, json={"d": rows})
+    actual, seen = make(handler=handler, discovery=False)
+    assert isinstance(actual._loader.actual, BingCredentialLoader)
+    result = actual.read(req.operation, req)
+    if membership == "true":
+        assert result.status == "ok" and result.error is None
+        assert [r.kind for r in result.records] == [kind] and len(seen) == 2
+    else:
+        code = "site_denied" if membership in {"false", "absent"} else "invalid_response"
+        assert result.error.code == code and result.records == [] and len(seen) == 1
+    assert seen[0].url.path.endswith("/GetUserSites")
+    assert len(boundary._GLOBAL.attempts) == len(seen)
+
+
+@pytest.mark.parametrize("op,inputs,params,rows,kind", CASES[1:])
+def test_business_admission_charges_same_twelve_attempt_quota(op, inputs, params, rows, kind):
+    boundary._GLOBAL.attempts.extend([time.monotonic()] * 11)
+    actual, seen = make({"d": rows})
+    req = request(op, **inputs)
+    result = actual.read(req.operation, req)
+    assert result.error.code == "rate_limited" and result.records == []
+    assert len(seen) == 1 and seen[0].url.path.endswith("/GetUserSites")
+    assert len(boundary._GLOBAL.attempts) == 12
+    assert boundary._GLOBAL.slot.acquire(timeout=1)
+    boundary._GLOBAL.slot.release()
+
+
+@pytest.mark.parametrize("op,inputs,params,rows,kind", CASES[1:])
+@pytest.mark.parametrize("stage", ["entry", "send_hook"])
+@pytest.mark.parametrize("elapsed", [16, 61])
+def test_business_entry_deadline_recheck_every_property_path(
+    op, inputs, params, rows, kind, stage, elapsed, monkeypatch,
+):
+    clock = Clock()
+    wire, delayed = [], []
+    class Transport(httpx.MockTransport):
+        def __enter__(self):
+            result = super().__enter__()
+            if wire and stage == "entry":
+                clock.value += elapsed
+                delayed.append(True)
+            return result
+    def hook(req):
+        if not req.url.path.endswith("/GetUserSites") and stage == "send_hook":
+            clock.value += elapsed
+            delayed.append(True)
+    original = httpx.Client
+    def factory(**kwargs):
+        return original(**kwargs, event_hooks={"request": [hook]})
+    def handler(req):
+        wire.append(req.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]})
+    monkeypatch.setattr(httpx, "Client", factory)
+    actual = BingReadClient(BingCredentialLoader(), transport=Transport(handler), clock=clock)
+    req = request(op, **inputs)
+    result = actual.read(req.operation, req)
+    assert delayed == [True] and wire == ["GetUserSites"]
+    assert result.error.code == "timeout" and not result.records
+    assert len(boundary._GLOBAL.attempts) == 2
+    assert boundary._GLOBAL.slot.acquire(timeout=1)
+    boundary._GLOBAL.slot.release()
+
+
+def test_list_complete_union_false_visible_exact_dedup_no_limit():
+    rows = [{"Url": f"https://agency-{i:03d}.com/", "IsVerified": i % 2 == 0,
+             "AuthenticationCode": "discard", "DnsVerificationCode": "discard"}
+            for i in range(140)]
+    client, seen = make({"d": list(reversed(rows)) + rows[:3]}, discovery=False)
+    result = client.read(BingOperation.GET_USER_SITES, request("GetUserSites"))
+    assert result.status == "ok" and result.error is None
+    assert [(r.url, r.is_verified) for r in result.records] == [
+        (row["Url"], row["IsVerified"]) for row in rows]
+    assert (result.source_rows, result.returned_rows, result.dropped_rows) == (143, 140, 0)
+    assert not result.local_truncated and result.provider_completeness == "unknown"
+    assert "discard" not in result.model_dump_json() and len(seen) == 1
+
+
+def test_next_request_rediscovers_revocation_without_cached_authority():
+    discoveries = []
+    def handler(wire):
+        if wire.url.path.endswith("/GetUserSites"):
+            discoveries.append(True)
+            return httpx.Response(200, json={"d": [{"Url": SITE,
+                "IsVerified": len(discoveries) == 1}]})
+        return httpx.Response(200, json={"d": [QUERY]})
+    client, seen = make(handler=handler, discovery=False)
+    assert client.read(request().operation, request()).status == "ok"
+    second = client.read(request().operation, request())
+    assert second.error.code == "site_denied" and not second.records
+    assert [r.url.path.rsplit("/", 1)[-1] for r in seen] == [
+        "GetUserSites", "GetQueryStats", "GetUserSites"]
+
+
+@pytest.mark.parametrize("op,inputs,params,rows,kind", CASES[1:])
+@pytest.mark.parametrize("fault,code", [("http403", "access_denied"),
+    ("http429", "rate_limited"), ("http503", "provider_error"),
+    ("timeout", "timeout"), ("invalid", "invalid_response")])
+def test_discovery_fault_is_typed_not_empty_or_site_denied(
+    op, inputs, params, rows, kind, fault, code,
+):
+    def handler(wire):
+        assert wire.url.path.endswith("/GetUserSites")
+        if fault == "timeout":
+            raise httpx.ReadTimeout("synthetic_timeout")
+        if fault == "invalid":
+            return httpx.Response(200, content=b'{"d":null}')
+        return httpx.Response(int(fault[4:]), json={"d": []})
+    client, seen = make(handler=handler, discovery=False)
+    req = request(op, **inputs)
+    result = client.read(req.operation, req)
+    assert result.error.code == code and not result.records
+    assert result.status != "empty" and len(seen) == 1
+    assert len(boundary._GLOBAL.attempts) == 1
+
+
+@pytest.mark.parametrize("op,inputs,params,rows,kind", CASES[1:])
+@pytest.mark.parametrize("expire", [False, True])
+def test_two_attempts_share_one_budget_deadline_and_quota(
+    monkeypatch, expire, op, inputs, params, rows, kind,
+):
+    clock = Clock()
+    budgets, observed = [], []
+    original = boundary._Budget
+    class Budget(original):
+        def __init__(self, clock):
+            super().__init__(clock)
+            self.end = clock() + 10
+            budgets.append(self)
+    class Client(BingReadClient):
+        def _attempt(self, req, budget, **kwargs):
+            observed.append((req.operation, budget, budget.end, budget.remaining()))
+            return super()._attempt(req, budget, **kwargs)
+    def handler(wire):
+        discovery = wire.url.path.endswith("/GetUserSites")
+        clock.value += 4 if discovery else (7 if expire else 4)
+        return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]
+                                      if discovery else rows})
+    monkeypatch.setattr(boundary, "_Budget", Budget)
+    actual = Client(BingCredentialLoader(), transport=httpx.MockTransport(handler), clock=clock)
+    req = request(op, **inputs)
+    result = actual.read(req.operation, req)
+    assert len(budgets) == 1 and len(observed) == 2
+    assert all(row[1] is budgets[0] and row[2] == 10 for row in observed)
+    assert [row[3] for row in observed] == [10, 6]
+    assert len(boundary._GLOBAL.attempts) == 2
+    if expire:
+        assert result.error.code == "timeout" and not result.records
+    else:
+        assert result.status == "ok" and result.error is None
+
+
+@pytest.mark.parametrize("op,inputs,params,rows,kind", CASES[1:])
+@pytest.mark.parametrize("stage", ["entry", "send_hook"])
+@pytest.mark.parametrize("change", ["replace", "permissions", "reconfigure"])
+def test_custody_after_entry_and_httpx_hooks_blocks_every_business_path(
+    op, inputs, params, rows, kind, stage, change, monkeypatch,
+):
+    loader = BingCredentialLoader()
+    path = loader._boundary.key
+    events, wire = [], []
+    def mutate():
+        events.append("mutation")
+        if change == "replace":
+            replacement = path.with_name("replacement.json")
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o600)
+            replacement.replace(path)
+        elif change == "permissions":
+            path.chmod(0o666)
+        else:
+            configure_bing_auth(SimpleNamespace(bing_credentials_file=path))
+    class Transport(httpx.MockTransport):
+        def __enter__(self):
+            result = super().__enter__()
+            if stage == "entry" and wire:
+                mutate()
+            return result
+    def hook(req):
+        if stage == "send_hook" and not req.url.path.endswith("/GetUserSites"):
+            mutate()
+    original = httpx.Client
+    def factory(**kwargs):
+        return original(**kwargs, event_hooks={"request": [hook]})
+    def handler(req):
+        wire.append(req.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]})
+    monkeypatch.setattr(httpx, "Client", factory)
+    actual = BingReadClient(loader, transport=Transport(handler))
+    req = request(op, **inputs)
+    result = actual.read(req.operation, req)
+    assert events == ["mutation"] and wire == ["GetUserSites"]
+    assert result.error.code == "credentials_invalid" and not result.records
+    with pytest.raises(BingAuthError):
+        loader.load()
+    assert boundary._GLOBAL.slot.acquire(timeout=1)
+    boundary._GLOBAL.slot.release()
+
+
+@pytest.mark.parametrize("policy", ["always", "error"])
+@pytest.mark.parametrize("stage", ["entry", "send_hook", "handler", "close"])
+def test_dependency_warnings_before_real_logrecords_are_static(
+    policy, stage, monkeypatch, caplog, capsys,
+):
+    import warnings
+    records, delivered, sites = [], [], []
+    original_factory = logging.getLogRecordFactory()
+    def factory(*args, **kwargs):
+        record = original_factory(*args, **kwargs)
+        records.append(record)
+        return record
+    class Observer(logging.Handler):
+        def emit(self, record):
+            delivered.append(record)
+    def warn():
+        warnings.warn(KEY, RuntimeWarning, stacklevel=1)
+    class Transport(httpx.MockTransport):
+        def __enter__(self):
+            if stage == "entry":
+                warn()
+            return super().__enter__()
+        def close(self):
+            if stage == "close":
+                warn()
+            return super().close()
+    def hook(req):
+        if stage == "send_hook":
+            warn()
+    def handler(req):
+        sites.append(req.url.path.rsplit("/", 1)[-1])
+        if stage == "handler":
+            warn()
+        return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]
+            if req.url.path.endswith("/GetUserSites") else []})
+    original_client = httpx.Client
+    def client_factory(**kwargs):
+        return original_client(**kwargs, event_hooks={"request": [hook]})
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    monkeypatch.setattr(logging, "_logRecordFactory", factory)
+    logger = logging.getLogger("py.warnings")
+    observer = Observer()
+    logger.addHandler(observer)
+    caplog.set_level(logging.WARNING)
+    previous = warnings.showwarning
+    try:
+        logging.captureWarnings(True)
+        with warnings.catch_warnings():
+            warnings.simplefilter(policy)
+            actual = BingReadClient(BingCredentialLoader(), transport=Transport(handler))
+            result = actual.read(request().operation, request())
+        if policy == "always":
+            assert result.status == "empty" and result.error is None
+            assert sites == ["GetUserSites", "GetQueryStats"]
+            assert len(records) == len(delivered) == 2
+            for record in records:
+                assert "bing_dependency_warning" in record.getMessage()
+                assert KEY not in repr(vars(record)) and record.exc_info is None
+        else:
+            assert result.error.code == "transport_error" and not result.records
+            assert records == delivered == []
+            assert sites == (["GetUserSites"] if stage in {"handler", "close"} else [])
+        assert KEY not in caplog.text
+        captured = capsys.readouterr()
+        assert KEY not in captured.out + captured.err
+    finally:
+        logging.captureWarnings(False)
+        warnings.showwarning = previous
+        logger.removeHandler(observer)
+    logging.getLogger("unrelated.warning.boundary").warning("ordinary_unrelated_record")
+    assert records[-1].getMessage() == "ordinary_unrelated_record"
+
+
+@pytest.mark.parametrize("location", ["raw_ignored", "parsed_ignored", "headers"])
+@pytest.mark.parametrize("encoding", ["literal", "percent", "base64", "hex"])
+def test_actual_raw_producer_checks_private_fields_before_return(location, encoding, monkeypatch):
+    import base64
+    reflected = {"literal": KEY, "percent": quote(KEY, safe=""),
+                 "base64": base64.b64encode(KEY.encode()).decode(),
+                 "hex": KEY.encode().hex()}[encoding]
+    returned, sent, scanned = [], [], []
+    original_scan = boundary._reject_reflection
+
+    def scanner(value, key):
+        if isinstance(value, str):
+            scanned.append("raw")
+            if location == "parsed_ignored":
+                # Isolate the later parsed-ignored guard: the full raw guard is
+                # independently exercised by raw_ignored with no bypass.
+                return
+        if isinstance(value, dict) and "d" in value:
+            scanned.append("parsed")
+        return original_scan(value, key)
+
+    monkeypatch.setattr(boundary, "_reject_reflection", scanner)
+    class Client(BingReadClient):
+        def _attempt(self, req, budget, **kwargs):
+            raw = super()._attempt(req, budget, **kwargs)
+            returned.append(raw)
+            return raw
+    def handler(req):
+        sent.append(True)
+        headers = (httpx.Headers([(b"X-Ignored", reflected.encode("utf-8"))])
+                   if location == "headers" else {})
+        data = {"d": [{"Url": SITE, "IsVerified": True,
+                       "AuthenticationCode": reflected if location != "headers" else "discard"}]}
+        if location == "raw_ignored":
+            body = json.dumps(data, ensure_ascii=True).encode()
+            return httpx.Response(200, content=body, headers=headers)
+        return httpx.Response(200, json=data, headers=headers)
+    actual = Client(BingCredentialLoader(), transport=httpx.MockTransport(handler))
+    result = actual.read(request().operation, request())
+    assert result.error.code == "credential_reflection" and not result.records
+    assert sent == [True] and returned == [] and KEY not in result.model_dump_json()
+    if location == "parsed_ignored":
+        assert scanned == ["raw", "parsed"]
+    elif location == "raw_ignored":
+        assert scanned == ["raw"]
+    else:
+        assert scanned == []  # Headers refuse before either body scan.
+
+
+def test_actual_raw_response_typed_attributes_not_merely_empty_dump():
+    from google_seo_mcp.bing.models import BingRawResponse
+    loader = BingCredentialLoader()
+    body = b'{"d":[]}'
+    sent = []
+    def handler(req):
+        sent.append(req.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, content=body, headers={"Retry-After": "3"})
+    actual = BingReadClient(loader, transport=httpx.MockTransport(handler))
+    raw = actual._attempt(request("GetUserSites"), boundary._Budget(Clock()))
+    assert type(raw) is BingRawResponse
+    assert raw.body == body and raw.retry_after == "3" and raw.status_code == 200
+    assert raw.credential_generation == loader.generation()
+    assert raw.model_dump() == {} and raw.model_dump_json() == "{}"
+    assert not hasattr(raw, "api_key") and KEY not in repr(raw)
+    assert sent == ["GetUserSites"]
+
+
+@pytest.mark.parametrize("kind", ["keyboard", "system", "async"])
+def test_caller_control_cancels_claimed_worker_retains_slot_no_late_wire(kind, monkeypatch):
+    import asyncio
+    control = {"keyboard": KeyboardInterrupt, "system": SystemExit,
+               "async": asyncio.CancelledError}[kind]()
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    sent = []
+    class Transport(httpx.MockTransport):
+        def __enter__(self):
+            entered.set()
+            assert release.wait(3)
+            return super().__enter__()
+        def close(self):
+            closed.set()
+            return super().close()
+    original = threading.Thread
+    workers = []
+    class Thread(original):
+        def start(self):
+            super().start()
+            if self.name == "bing-read":
+                workers.append(self)
+                assert entered.wait(1)
+                raise control
+    monkeypatch.setattr(boundary.threading, "Thread", Thread)
+    actual = BingReadClient(BingCredentialLoader(), transport=Transport(
+        lambda req: (sent.append(True), httpx.Response(200, json={"d": []}))[1]))
+    try:
+        with pytest.raises(BaseException) as caught:
+            actual.read(request().operation, request())
+        assert caught.value is control
+        assert not boundary._GLOBAL.slot.acquire(blocking=False)
+        assert sent == []
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+    assert closed.is_set() and sent == []
+    assert boundary._GLOBAL.slot.acquire(timeout=1)
+    boundary._GLOBAL.slot.release()
+
+
+@pytest.mark.parametrize("stage", ["construction", "unclaimed_start"])
+def test_worker_partial_startup_revokes_before_late_target(stage, monkeypatch):
+    released, actions, targets = [], [], []
+    budget = boundary._Budget(Clock())
+    if stage == "construction":
+        def fail(*args):
+            raise OSError("synthetic_startup")
+        monkeypatch.setattr(boundary, "_Ownership", fail)
+    else:
+        class Thread:
+            def __init__(self, *, target, **kwargs):
+                targets.append(target)
+            def start(self):
+                raise OSError("synthetic_startup")
+        monkeypatch.setattr(boundary.threading, "Thread", Thread)
+    with pytest.raises(OSError):
+        boundary._worker(lambda: actions.append(True), budget, budget.remaining,
+                         release=lambda: released.append(True))
+    assert budget.remaining() == 0 and released == [True]
+    for target in targets:
+        target()
+    assert actions == [] and released == [True]

@@ -11,6 +11,10 @@ from ..gsc.dates import period as gsc_period
 from ..guardrails import with_meta
 
 
+from ..auth import is_hosted_production
+from ..gsc.tools import analytics as _gsc_analytics
+from ..google_accounts.routing import _property_id
+
 def gsc_to_ga4_journey(
     site_url: str,
     property_id: int | str,
@@ -47,12 +51,12 @@ def gsc_to_ga4_journey(
               else f"https://{site_url[len('sc-domain:'):]}{path}")
     )
 
-    pid = normalize_property(property_id)
+    pid = _property_id(property_id) if is_hosted_production() else normalize_property(property_id)
 
     # ── GSC side ─────────────────────────────────────────────
     gsc_start, gsc_end = gsc_period(days)
-    gsc_rows = query_search_analytics(
-        get_webmasters(),
+    gsc_rows = _gsc_analytics._run_query(
+        _gsc_analytics._read_client(site_url, get_webmasters), query_search_analytics,
         site_url,
         gsc_start,
         gsc_end,
@@ -92,7 +96,7 @@ def gsc_to_ga4_journey(
         ]
     }
     overview = run_report(
-        pid,
+        property_id if is_hosted_production() else pid,
         start_date=ga_start,
         end_date=ga_end,
         metrics=[
@@ -109,7 +113,7 @@ def gsc_to_ga4_journey(
         aggregations=["TOTAL"],
     )
     next_pages = run_report(
-        pid,
+        property_id if is_hosted_production() else pid,
         start_date=ga_start,
         end_date=ga_end,
         metrics=["screenPageViews"],

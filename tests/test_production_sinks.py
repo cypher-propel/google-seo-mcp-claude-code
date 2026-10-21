@@ -7,10 +7,11 @@ import json
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
-from google.api_core.exceptions import GoogleAPIError
+import requests
 
 from google_seo_mcp import auth, server
 from google_seo_mcp.bing import auth as bing_auth
@@ -18,6 +19,8 @@ from google_seo_mcp.bing import client as bing_client
 from google_seo_mcp.bing import tools as bing_tools
 from google_seo_mcp.bing.models import BingCredentialDocument
 from google_seo_mcp.crossplatform import multi_property
+from google_seo_mcp.google_accounts import clients as google_clients
+from google_seo_mcp.google_accounts.models import GoogleAccountError
 from google_seo_mcp.gsc.tools import sitemaps
 from google_seo_mcp.runtime_config import ProductionRuntimeConfig, load_runtime_config
 from tests.test_server_registration import ANALYTICS, BING_ROUTES, SITE, bing_arguments, sdk_call
@@ -40,16 +43,79 @@ def isolated_identity(monkeypatch):
 
 
 @pytest.fixture
-def hosted(tmp_path):
+def sink_google_custody():
+    # Explicit protected synthetic documents for both accepted named slots.
+    from tests.test_google_accounts_auth import custody
+
+    fixture = custody.__wrapped__()
+    try:
+        yield next(fixture)
+    finally:
+        fixture.close()
+
+
+@pytest.fixture
+def hosted(sink_google_custody):
+    from tests.test_google_accounts_auth import CLIENT
+
+    root = sink_google_custody[0]
     config = ProductionRuntimeConfig(
         profile="production",
         transport="streamable-http",
-        google_auth_mode="service-account",
-        service_account_file=tmp_path / "absent-service-account.json",
-        consumer_keys_file=tmp_path / "unused-registry.json",
+        public_base_url="https://synthetic.invalid",
+        google_auth_mode="dual-user-oauth",
+        google_oauth_client_file=root / "client.json",
+        google_oauth_propel_dms_file=root / "a.json",
+        google_oauth_addourteam99_file=root / "b.json",
+        google_approved_client_id=CLIENT,
+        google_approved_project_id="synthetic-seq208",
+        consumer_keys_file=root / "unused-registry.json",
     )
     auth.configure_hosted_auth(config)
     return config
+
+
+@pytest.fixture
+def sink_google_wire(hosted, sink_google_custody, monkeypatch):
+    """Keep OAuth, discovery, routing and SDKs real; replace only HTTP send."""
+    from tests.test_google_accounts_auth import ACCOUNTS, LocalWire, close_resources
+
+    wire = LocalWire(sink_google_custody[1])
+    for account in ACCOUNTS:
+        wire.sites[account] = [
+            {"siteUrl": "https://example.com/", "permissionLevel": "siteOwner"}
+        ]
+        wire.pages[account] = [{"accountSummaries": [{
+            "account": "accounts/1",
+            "propertySummaries": [{
+                "property": "properties/123", "displayName": "synthetic",
+                "parent": "accounts/1", "propertyType": "PROPERTY_TYPE_ORDINARY",
+            }],
+        }]}]
+    sessions = []
+    session_init = requests.sessions.Session.__init__
+
+    def tracked_session(session, *args, **kwargs):
+        session_init(session, *args, **kwargs)
+        sessions.append(session)
+
+    monkeypatch.setattr(requests.sessions.Session, "__init__", tracked_session)
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter, "send",
+        lambda adapter, request, **kwargs: wire.send(request, **kwargs),
+    )
+    registry = auth.get_google_account_registry()
+    primary = None
+    try:
+        yield wire
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            registry.retire()
+        finally:
+            close_resources([*sessions, *wire.responses], primary)
 
 
 @pytest.mark.parametrize(
@@ -57,6 +123,7 @@ def hosted(tmp_path):
     [
         (RuntimeError("credentials_missing"), "credentials_missing"),
         (RuntimeError("credentials_invalid"), "credentials_invalid"),
+        (GoogleAccountError("agency_discovery_incomplete"), "agency_discovery_incomplete"),
         (RuntimeError("credentials_missing: private-provider-sentinel"), "provider_unavailable"),
         (RuntimeError("private-provider-sentinel /run/secrets/key.json"), "provider_unavailable"),
         (ValueError("private-provider-sentinel"), "provider_unavailable"),
@@ -84,6 +151,12 @@ def test_hosted_does_not_stringify_unknown_provider_exception(hosted, monkeypatc
 
 
 def test_missing_hosted_credentials_never_use_legacy_or_client_constructor(hosted, monkeypatch):
+    # Absent named documents under the protected synthetic parent, not a retired
+    # SA path or an unsafe pytest temporary ancestor that could mask absence.
+    auth.configure_hosted_auth(hosted.model_copy(update={
+        "google_oauth_propel_dms_file": hosted.google_oauth_propel_dms_file.with_name("absent-a.json"),
+        "google_oauth_addourteam99_file": hosted.google_oauth_addourteam99_file.with_name("absent-b.json"),
+    }))
     forbidden = Mock(side_effect=AssertionError("unexpected credential/client fallback"))
     for name in (
         "_from_adc",
@@ -93,22 +166,57 @@ def test_missing_hosted_credentials_never_use_legacy_or_client_constructor(hoste
         "BetaAnalyticsDataClient",
     ):
         monkeypatch.setattr(auth, name, forbidden)
+    for name in ("Credentials", "build", "BetaAnalyticsDataClient", "AnalyticsAdminServiceClient"):
+        monkeypatch.setattr(google_clients, name, forbidden)
     result = multi_property.multi_property_comparison([123, 456])
-    assert [row["error"] for row in result["data"]] == ["credentials_missing"] * 2
+    assert [row["error"] for row in result["data"]] == ["agency_discovery_incomplete"] * 2
+    assert all(row["total"] is None and row["breakdown"] is None for row in result["data"])
     forbidden.assert_not_called()
 
 
-def test_hosted_real_report_path_redacts_humanized_google_error(hosted, monkeypatch, caplog):
+def test_hosted_real_report_path_redacts_humanized_google_error(
+    hosted, sink_google_wire, monkeypatch, caplog
+):
+    from google.api_core.exceptions import GoogleAPIError
     from google_seo_mcp.ga4 import data
 
-    client = Mock()
-    client.run_report.side_effect = GoogleAPIError("private-provider-sentinel")
-    monkeypatch.setattr(data, "get_data_client", Mock(return_value=client))
+    wire = sink_google_wire
+    send = wire.send
+    business = Mock(side_effect=GoogleAPIError("private-provider-sentinel"))
+
+    def failing_business(request, **kwargs):
+        if urlsplit(request.url).path.endswith(":runReport"):
+            return business(request, **kwargs)
+        return send(request, **kwargs)
+
+    monkeypatch.setattr(wire, "send", failing_business)
+    account_clients = auth.get_google_account_registry().clients
+    execute = account_clients.execute
+    safe_failures = []
+
+    def observe_account_boundary(*args, **kwargs):
+        try:
+            return execute(*args, **kwargs)
+        except GoogleAccountError as error:
+            safe_failures.append((
+                error.code, error.__cause__ is None, error.__context__ is None,
+            ))
+            raise
+
+    monkeypatch.setattr(account_clients, "execute", observe_account_boundary)
+    legacy_getter = Mock(side_effect=AssertionError("unbound Google client accessed"))
+    monkeypatch.setattr(data, "get_data_client", legacy_getter)
     result = multi_property.multi_property_comparison([123])
-    assert result["data"][0]["error"] == "provider_unavailable"
+    # The account executor now sanitizes SDK errors before the nested helper;
+    # legacy _humanize_error is deliberately not part of hosted dispatch.
+    assert result["data"][0]["error"] == "agency_discovery_incomplete"
+    assert result["data"][0]["total"] is result["data"][0]["breakdown"] is None
     assert "private-provider-sentinel" not in json.dumps(result)
     assert "private-provider-sentinel" not in caplog.text
-    client.run_report.assert_called_once()
+    business.assert_called_once()
+    assert safe_failures == [("agency_discovery_incomplete", True, True)]
+    assert urlsplit(business.call_args.args[0].url).path == "/v1beta/properties/123:runReport"
+    legacy_getter.assert_not_called()
 
 
 def test_stdio_keeps_legacy_nested_error_diagnostics(monkeypatch):
@@ -207,14 +315,34 @@ def test_stdio_sitemap_optin_preserves_submit_behavior(monkeypatch):
     assert result["data"] == {"status": "submitted", "feedpath": "https://example.com/sitemap.xml"}
 
 
-def test_hosted_read_sitemap_behavior_unchanged(hosted, monkeypatch):
-    client = Mock()
-    client.sitemaps.return_value.list.return_value.execute.return_value = {
-        "sitemap": [{"path": "safe"}]
-    }
-    monkeypatch.setattr(sitemaps, "get_webmasters", Mock(return_value=client))
+def test_hosted_read_sitemap_behavior_unchanged(hosted, sink_google_wire, monkeypatch):
+    from tests.test_google_accounts_auth import ACCOUNTS
+
+    wire = sink_google_wire
+    send = wire.send
+    business = []
+
+    def sitemap_response(request, **kwargs):
+        response = send(request, **kwargs)
+        if urlsplit(request.url).path.endswith("/sitemaps"):
+            business.append(request)
+            response._content = json.dumps({"sitemap": [{"path": "safe"}]}).encode()
+        return response
+
+    monkeypatch.setattr(wire, "send", sitemap_response)
+    getter = Mock(side_effect=AssertionError("hosted read used unbound Google getter"))
+    monkeypatch.setattr(sitemaps, "get_webmasters", getter)
     result = sitemaps.list_sitemaps("https://example.com/")
-    client.sitemaps.return_value.list.assert_called_once_with(siteUrl="https://example.com/")
+    assert len(business) == 1
+    request = business[0]
+    assert request.method == "GET"
+    assert urlsplit(request.url).netloc == "www.googleapis.com"
+    assert urlsplit(request.url).path == (
+        "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F/sitemaps"
+    )
+    assert request.headers["Authorization"] == "Bearer " + wire.access[ACCOUNTS[0]]
+    assert all((account, True) in wire.scopes for account in ACCOUNTS)
+    getter.assert_not_called()
     assert result["data"] == [{"path": "safe"}]
 
 
@@ -241,19 +369,25 @@ def bing_server(request, monkeypatch):
 
 
 class SyntheticBingLoader:
-    """Synthetic custody seam only; actual admission/client/normalizer execute."""
-
-    allowed_sites = frozenset({SITE})
+    """Synthetic key custody only; actual provider discovery admits sites."""
 
     def __init__(self):
         self.loads = 0
+        self.generations = 0
+        self.requirements = []
 
     def load(self):
         self.loads += 1
         return BingCredentialDocument(version=1, api_key="synthetic-policy-sink-key-8271")
 
-    def authorize_site(self, site):
-        assert site == SITE
+    def generation(self):
+        self.generations += 1
+        self.load()
+        return "synthetic-sink-generation"
+
+    def require_generation(self, expected):
+        self.requirements.append(expected)
+        assert self.generation() == expected
 
 
 def synthetic_bing_wire(row):
@@ -295,8 +429,10 @@ def test_bing_provider_fault_or_redirect_never_becomes_empty_success(bing_server
         assert value["data"]["error"]["code"] == "provider_error"
         assert value["data"]["records"] == []
         assert "SYNTHETIC_PRIVATE" not in json.dumps(result)
-    assert len(seen) == 11  # No discovery, redirect follow, retry or pagination.
+    assert len(seen) == 11  # One failed fresh discovery per call; no business/retry/follow.
     assert all(r.url.host == "ssl.bing.com" and r.method == "GET" for r in seen)
+    assert all(r.url.path == "/webmaster/api.svc/json/GetUserSites" for r in seen)
+    assert all(dict(r.url.params) == {"apikey": "synthetic-policy-sink-key-8271"} for r in seen)
 
 
 @pytest.mark.parametrize("row", BING_ROUTES, ids=[r[0] for r in BING_ROUTES])
@@ -305,7 +441,12 @@ def test_each_bing_backend_reaches_only_exact_fixed_bing_sink(bing_server, monke
 
     def handler(request):
         seen.append(request)
-        return httpx.Response(200, json={"d": synthetic_bing_wire(row)})
+        data = (
+            [{"Url": SITE, "IsVerified": True}]
+            if request.url.path.endswith("/GetUserSites")
+            else synthetic_bing_wire(row)
+        )
+        return httpx.Response(200, json={"d": data})
 
     bing_tools.configure_bing_tools(
         bing_client.BingReadClient(
@@ -327,10 +468,30 @@ def test_each_bing_backend_reaches_only_exact_fixed_bing_sink(bing_server, monke
     assert result["isError"] is False
     value = json.loads(result["content"][0]["text"])
     assert value["data"]["operation"] == row[1]
-    assert value["data"]["status"] == ("ok" if row[0] == "bing_url_info" else "empty")
+    assert value["data"]["status"] == (
+        "ok" if row[0] in {"bing_list_sites", "bing_url_info"} else "empty"
+    )
     assert value["_meta"]["source"] == "bing_webmaster"
-    assert len(seen) == 1 and loader.loads == 2
-    request = seen[0]
+    discovery_only = row[0] == "bing_list_sites"
+    assert len(seen) == (1 if discovery_only else 2)
+    # Keep the original authorization-read bound separate from added generation
+    # custody observations; no static authorizer or extra business calls.
+    assert loader.loads == (2 if discovery_only else 3) + loader.generations
+    assert loader.generations == len(seen) + len(loader.requirements)
+    assert loader.requirements and set(loader.requirements) == {"synthetic-sink-generation"}
+    discovery = seen[0]
+    assert discovery.url.path == "/webmaster/api.svc/json/GetUserSites"
+    assert dict(discovery.url.params) == {"apikey": "synthetic-policy-sink-key-8271"}
+    assert all(
+        (request.method, request.url.scheme, request.url.host, request.url.port)
+        == ("GET", "https", "ssl.bing.com", None)
+        for request in seen
+    )
+    assert all(
+        request.headers["Content-Type"] == "application/json; charset=utf-8"
+        for request in seen
+    )
+    request = seen[-1]
     assert request.method == "GET"
     assert (request.url.scheme, request.url.host, request.url.port) == (
         "https",
@@ -348,7 +509,10 @@ def test_each_bing_backend_reaches_only_exact_fixed_bing_sink(bing_server, monke
 
 
 @pytest.mark.parametrize("profile", ["legacy", "production"])
-def test_pending_bing_calls_no_http_and_composition_is_lazy(tmp_path, monkeypatch, profile):
+def test_pending_bing_calls_no_http_and_composition_is_lazy(
+    sink_google_custody, monkeypatch, profile
+):
+    root = sink_google_custody[0]
     monkeypatch.setattr(server, "_configure_hosted_logging", lambda: None)
     config = (
         ProductionRuntimeConfig()
@@ -360,8 +524,7 @@ def test_pending_bing_calls_no_http_and_composition_is_lazy(tmp_path, monkeypatc
     )
     config = config.model_copy(
         update={
-            "bing_credentials_file": tmp_path / "absent-synthetic-key.json",
-            "bing_sites_file": tmp_path / "absent-synthetic-policy.json",
+            "bing_credentials_file": root / "absent-synthetic-key.json",
             "require_bing_credentials": False,
         }
     )
@@ -372,7 +535,7 @@ def test_pending_bing_calls_no_http_and_composition_is_lazy(tmp_path, monkeypatc
     acquire = bing_auth._HeldDocument.acquire
 
     def observe_acquire(held, descriptors):
-        # Execute actual retained-pair acquisition on absent synthetic paths.
+        # Execute actual key-only acquisition on the absent synthetic path.
         acquire(held, descriptors)
         acquired.append((held.path, held.state, held.fd, held.document))
 
@@ -403,9 +566,8 @@ def test_pending_bing_calls_no_http_and_composition_is_lazy(tmp_path, monkeypatc
                 assert value["data"]["records"] == []
                 assert value["_meta"]["source"] == "bing_webmaster"
         assert acquired == [
-            (path, "pending", None, None)
+            (config.bing_credentials_file, "pending", None, None)
             for _ in BING_ROUTES
-            for path in (config.bing_credentials_file, config.bing_sites_file)
         ]
         deny.assert_not_called()
     finally:

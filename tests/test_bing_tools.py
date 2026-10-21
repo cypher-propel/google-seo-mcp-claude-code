@@ -43,8 +43,9 @@ URL = dict(AnchorCount=1, DiscoveryDate=DATE, DocumentSize=123, HttpStatus=200, 
 CASES = [
     ("bing_list_sites", "GetUserSites", {}, {},
      [{"Url": SITE, "IsVerified": True, "AuthenticationCode": "discard-code",
-       "DnsVerificationCode": "discard-code"}, {"Url": SITE, "IsVerified": False},
-      {"Url": "https://other.com/", "IsVerified": True}], "site", "unknown"),
+       "DnsVerificationCode": "discard-code"},
+      {"Url": "https://other.com/", "IsVerified": True},
+      {"Url": "https://unverified.com/", "IsVerified": False}], "site", "unknown"),
     ("bing_rank_traffic_stats", "GetRankAndTrafficStats", {}, {},
      [dict(Date=DATE, Clicks=2, Impressions=8)], "traffic", "daily"),
     ("bing_query_stats", "GetQueryStats", {}, {}, [QUERY], "query", "weekly"),
@@ -75,13 +76,12 @@ class Loader:
             raise BingAuthError(self.fail)
         return BingCredentialDocument(version=1, api_key=KEY)
 
-    @property
-    def allowed_sites(self):
-        return frozenset({SITE})
+    def generation(self):
+        return "synthetic-tools-generation"
 
-    def authorize_site(self, site):
-        if site != SITE:
-            raise BingAuthError("site_denied")
+    def require_generation(self, expected):
+        if expected != self.generation():
+            raise BingAuthError("credentials_invalid")
 
 
 @pytest.fixture(autouse=True)
@@ -97,18 +97,34 @@ def offline(monkeypatch):
     configure_bing_auth(None)
 
 
-def inject(payload, *, status=200, loader=None):
+def inject(payload, *, status=200, loader=None, operation=None, discovery=None):
     seen = []
     loader = loader or Loader()
 
     def upstream(request):
         seen.append(request)
+        if request.url.path.endswith("/GetUserSites") and operation != "GetUserSites":
+            return httpx.Response(200, json={"d": discovery if discovery is not None else
+                                            [{"Url": SITE, "IsVerified": True}]})
         return httpx.Response(status, json=payload)
 
-    tools.configure_bing_tools(BingReadClient(
-        loader, transport=httpx.MockTransport(upstream), max_retries=0,
-    ))
+    client = BingReadClient(loader, transport=httpx.MockTransport(upstream), max_retries=0)
+    tools.configure_bing_tools(client)
+    assert tools._client is client
     return seen, loader
+
+
+def assert_stages(seen, operation, *, business=True):
+    expected = ["GetUserSites"]
+    if operation != "GetUserSites" and business:
+        expected.append(operation)
+    assert [request.url.path.rsplit("/", 1)[-1] for request in seen] == expected
+    for request in seen:
+        assert request.method == "GET" and not request.content
+        assert request.url.scheme == "https" and request.url.host == "ssl.bing.com"
+        assert request.url.port in (None, 443)
+        if request.url.path.endswith("/GetUserSites"):
+            assert dict(request.url.params) == {"apikey": KEY}
 
 
 def call(case, **extra):
@@ -140,16 +156,21 @@ def assert_meta(result, cadence):
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 def test_every_candidate_hits_exact_read_method(case):
     name, op, selectors, params, wire, kind, cadence = case
-    seen, _ = inject({"d": wire})
+    seen, _ = inject({"d": wire}, operation=op)
     extra = (
         {"start_date": "2024-01-01", "end_date": "2024-01-02", "limit": 1}
         if cadence != "unknown" else {}
     )
     data = assert_meta(call(case, **extra), cadence)
     assert data["operation"] == op and data["status"] == "ok"
-    assert data["returned_rows"] == 1 and data["records"][0]["kind"] == kind
-    assert len(seen) == 1  # no discovery, fan-out, paging, selector enrichment or retries
-    sent = seen[0]
+    assert data["returned_rows"] == (3 if op == "GetUserSites" else 1)
+    assert data["records"][0]["kind"] == kind
+    if op == "GetUserSites":
+        assert {(row["url"], row["is_verified"]) for row in data["records"]} == {
+            (SITE, True), ("https://other.com/", True), ("https://unverified.com/", False),
+        }
+    assert_stages(seen, op)  # fresh discovery, no fan-out, paging or retries
+    sent = seen[-1]
     assert sent.method == "GET" and not sent.content
     assert sent.url.scheme == "https" and sent.url.host == "ssl.bing.com"
     assert sent.url.port in (None, 443)
@@ -221,13 +242,13 @@ def test_omitted_query_and_unsupported_arguments_fail_pre_io():
 
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 def test_explicit_empty_not_zero_business_claim(case):
-    seen, _ = inject({"d": []})
+    seen, _ = inject({"d": []}, operation=case[1])
     data = assert_meta(call(case), case[-1])
     assert data["status"] == ("provider_error" if case[1] == "GetUrlInfo" else "empty")
     assert data["records"] == [] and data["returned_rows"] == 0
     assert data["observed_period"] is None and not data["local_truncated"]
     assert not {"clicks", "impressions", "indexed", "total", "average_position"} & data.keys()
-    assert len(seen) == 1
+    assert_stages(seen, case[1])
 
 
 @pytest.mark.parametrize("overrides", [
@@ -289,8 +310,7 @@ def test_unavailable_provider_never_silent_success(case, fault):
 
 
 def test_default_lazy_client_missing_optional_config(tmp_path):
-    config = ProductionRuntimeConfig(bing_credentials_file=tmp_path / "absent-key.json",
-                           bing_sites_file=tmp_path / "absent-sites.json")
+    config = ProductionRuntimeConfig(bing_credentials_file=tmp_path / "absent-key.json")
     configure_bing_auth(config)
     assert tools._client is None
     data = assert_meta(tools.bing_query_stats(SITE, "2024-01-01", "2024-01-02"), "weekly")
@@ -312,7 +332,8 @@ def test_faults_are_not_empty_and_keep_analytics_metadata(payload, status, expec
     data = assert_meta(tools.bing_query_stats(SITE, "2024-01-01", "2024-01-02"), "weekly")
     assert data["status"] in ("provider_error", "denied")
     assert data["error"]["code"] == expected and data["records"] == []
-    assert "untrusted input" not in json.dumps(data) and len(seen) == 1
+    assert "untrusted input" not in json.dumps(data)
+    assert_stages(seen, "GetQueryStats")
 
 
 def test_local_window_limit_and_partial_disclosures():
@@ -324,12 +345,12 @@ def test_local_window_limit_and_partial_disclosures():
     assert data["observed_period"] == {"start_date": "2024-01-01", "end_date": "2024-01-08"}
     assert {"weekly_buckets", "local_date_filter", "utc_date_filter", "local_limit",
             "invalid_rows_dropped", "window_not_exact"} <= set(data["warnings"])
-    assert len(seen) == 1
+    assert_stages(seen, "GetQueryStats")
     seen, _ = inject({"d": [QUERY]})
     data = assert_meta(tools.bing_query_stats(SITE, "2025-01-01", "2025-01-02"), "weekly")
     assert data["status"] == "empty" and data["source_rows"] == 1
     assert data["observed_period"]["start_date"] == "2024-01-01"
-    assert len(seen) == 1
+    assert_stages(seen, "GetQueryStats")
 
 
 @pytest.mark.parametrize("row", [
@@ -353,12 +374,13 @@ def test_true_zero_denominator_is_null_not_invented_ctr():
                                           "".join(f"\\u{ord(c):04x}" for c in KEY)])
 def test_real_client_reflection_never_reintroduced_in_metadata(reflection, caplog):
     # Reflection even in discarded unknown metadata must fail, not serialize.
-    inject({"d": [QUERY], "unknown": {"nested": reflection}})
+    seen, _ = inject({"d": [QUERY], "unknown": {"nested": reflection}})
     result = tools.bing_query_stats(SITE)
     data = assert_meta(result, "weekly")
     assert data["status"] == "provider_error" and data["error"]["code"] == "credential_reflection"
     assert data["site_url"] == "" and result["_meta"]["site_url"] == ""
     assert KEY not in json.dumps(result) and reflection not in json.dumps(result)
+    assert_stages(seen, "GetQueryStats")
     assert not caplog.records
 
 
@@ -424,22 +446,105 @@ def test_every_analytics_outcome_keeps_requested_and_observed_contract(case, out
     assert data["observed_period"] == (
         {"start_date": "2024-01-01", "end_date": "2024-01-01"} if outcome == "partial" else None
     )
-    assert len(seen) == (0 if outcome == "unavailable" else 1)
+    if outcome == "unavailable":
+        assert not seen
+    else:
+        assert_stages(seen, case[1])
 
 
-def test_unapproved_public_site_is_denial_without_hidden_discovery():
+def test_unlisted_public_site_is_denial_after_discovery_without_business():
     seen, loader = inject({"d": [QUERY]})
     data = assert_meta(tools.bing_query_stats("https://other.com/"), "weekly")
     assert data["status"] == "denied" and data["error"]["code"] == "site_denied"
-    assert loader.loads == 1 and not seen
+    assert loader.loads == 2
+    assert_stages(seen, "GetQueryStats", business=False)
+
+
+@pytest.mark.parametrize("inventory,code", [
+    ([], "site_denied"),
+    ([{"Url": SITE, "IsVerified": False}], "site_denied"),
+    ([{"Url": SITE}], "invalid_response"),
+    ([{"Url": SITE, "IsVerified": None}], "invalid_response"),
+    ([{"Url": SITE, "IsVerified": "true"}], "invalid_response"),
+    ([{"Url": SITE, "IsVerified": 1}], "invalid_response"),
+    ([{"Url": SITE, "IsVerified": True},
+      {"Url": SITE, "IsVerified": False}], "invalid_response"),
+    ([{"Url": SITE, "IsVerified": True},
+      {"Url": "http://127.0.0.1/", "IsVerified": True}], "invalid_response"),
+])
+def test_discovery_requires_complete_strict_true_before_business(inventory, code):
+    seen, _ = inject({"d": [QUERY]}, discovery=inventory)
+    result = tools.bing_query_stats(SITE)
+    data = assert_meta(result, "weekly")
+    assert data["error"]["code"] == code and data["records"] == []
+    assert data["status"] == ("denied" if code == "site_denied" else "provider_error")
+    assert data["site_url"] == "" and data["requested_period"] is None
+    assert_stages(seen, "GetQueryStats", business=False)
+
+
+def test_new_provider_verified_site_is_admitted_but_not_cached_after_revocation():
+    site = "https://other.com/"
+    inventory = [{"Url": site, "IsVerified": True}]
+    seen, _ = inject({"d": [QUERY]}, discovery=inventory)
+    data = assert_meta(tools.bing_query_stats(site), "weekly")
+    assert data["status"] == "ok" and data["site_url"] == site
+    assert_stages(seen, "GetQueryStats")
+    assert dict(seen[-1].url.params) == {"apikey": KEY, "siteUrl": site}
+    inventory[0] = {"Url": site, "IsVerified": False}
+    data = assert_meta(tools.bing_query_stats(site), "weekly")
+    assert data["status"] == "denied" and data["error"]["code"] == "site_denied"
+    assert [request.url.path.rsplit("/", 1)[-1] for request in seen] == [
+        "GetUserSites", "GetQueryStats", "GetUserSites",
+    ]
+
+
+@pytest.mark.parametrize("payload,status,code", [
+    ({}, 200, "invalid_response"),
+    ({"d": None}, 200, "invalid_response"),
+    ({"ErrorCode": 2, "Message": "never-emit"}, 200, "provider_error"),
+    ({"Message": "never-emit"}, 403, "access_denied"),
+    ({"d": []}, 429, "rate_limited"),
+    ({"d": []}, 503, "provider_error"),
+])
+def test_discovery_fault_keeps_cause_and_never_sends_business(payload, status, code):
+    seen, _ = inject(payload, status=status, operation="GetUserSites")
+    data = assert_meta(tools.bing_query_stats(SITE), "weekly")
+    assert data["error"]["code"] == code and data["records"] == []
+    assert data["status"] == ("denied" if code == "access_denied" else "provider_error")
+    assert data["site_url"] == "" and data["requested_period"] is None
+    assert "never-emit" not in json.dumps(data)
+    assert_stages(seen, "GetQueryStats", business=False)
+
+
+def test_discovery_and_business_share_budget_and_rolling_attempt_limit(monkeypatch):
+    budgets = []
+    attempt = BingReadClient._attempt
+
+    def observed(self, request, budget, **kwargs):
+        budgets.append(budget)
+        return attempt(self, request, budget, **kwargs)
+
+    monkeypatch.setattr(BingReadClient, "_attempt", observed)
+    seen, _ = inject({"d": [QUERY]})
+    for _ in range(6):
+        assert tools.bing_query_stats(SITE)["data"]["status"] == "ok"
+        assert budgets[-2] is budgets[-1]
+    assert all(budgets[index] is not budgets[index - 2] for index in range(2, 12, 2))
+    assert [request.url.path.rsplit("/", 1)[-1] for request in seen] == [
+        "GetUserSites", "GetQueryStats",
+    ] * 6
+    result = tools.bing_query_stats(SITE)
+    assert result["data"]["error"]["code"] == "rate_limited"
+    assert result["data"]["status"] == "provider_error" and len(seen) == 12
 
 
 @pytest.mark.parametrize("limit", [1, 1000])
 def test_inclusive_window_and_limit_boundaries_are_local(limit):
     seen, _ = inject({"d": [QUERY]})
     data = assert_meta(tools.bing_query_stats(SITE, "2024-01-01", "2025-01-01", limit), "weekly")
-    assert data["status"] == "ok" and len(seen) == 1
-    assert set(seen[0].url.params) == {"apikey", "siteUrl"}
+    assert data["status"] == "ok"
+    assert_stages(seen, "GetQueryStats")
+    assert set(seen[-1].url.params) == {"apikey", "siteUrl"}
 
 
 def test_import_and_composition_are_lazy_no_client_or_credential_work():
@@ -477,12 +582,15 @@ def default_transport(monkeypatch, case, failure=None):
     A retry would receive valid data, exposing both an extra dispatch and a
     wrongly successful outcome. All fixtures are synthetic and network-free.
     """
-    seen, constructed = [], []
+    seen, constructed, target_attempts = [], [], []
     loader = Loader()
 
     def upstream(request):
         seen.append(request)
-        if len(seen) == 1 and failure is not None:
+        if request.url.path.endswith("/GetUserSites") and case[1] != "GetUserSites":
+            return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]})
+        target_attempts.append(request)
+        if len(target_attempts) == 1 and failure is not None:
             if failure == "connect_error":
                 raise httpx.ConnectError("synthetic connect failure", request=request)
             if failure == "connect_timeout":
@@ -501,15 +609,15 @@ def default_transport(monkeypatch, case, failure=None):
 
 
 def assert_default_dispatch(case, seen, constructed, loader):
-    # This is the actual lazy constructor, real read/admission/retry loop,
+    # This is the actual lazy constructor, real read/admission/zero-retry flow,
     # real HTTPX Client and gated transport, not a constructor-call mock.
     assert type(tools._client) is BingReadClient
-    assert tools._client._max_retries == 0
+    assert inspect.signature(BingReadClient).parameters["max_retries"].default == 0
     assert tools._client._transport is None
-    assert loader.loads == 2  # initial admission plus the single attempt
-    assert constructed == [{"trust_env": False}]
-    assert len(seen) == 1
-    sent = seen[0]
+    assert loader.loads == (2 if case[1] == "GetUserSites" else 3)
+    assert constructed == [{"trust_env": False}] * (1 if case[1] == "GetUserSites" else 2)
+    assert_stages(seen, case[1])
+    sent = seen[-1]
     assert sent.method == "GET" and not sent.content
     assert sent.url.scheme == "https" and sent.url.host == "ssl.bing.com"
     assert sent.url.port in (None, 443)
@@ -527,21 +635,23 @@ def test_default_real_client_retryable_failure_is_one_transport_attempt(monkeypa
     assert data["status"] == "provider_error" and data["records"] == []
     assert data["error"]["code"] == (
         "rate_limited" if failure == 429 else
-        "transport_error" if isinstance(failure, str) else "provider_error"
+        "timeout" if failure == "connect_timeout" else
+        "transport_error" if failure == "connect_error" else "provider_error"
     )
     assert_default_dispatch(case, seen, constructed, loader)
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
-def test_default_real_client_positive_effect_without_extra_discovery(monkeypatch, case):
+def test_default_real_client_positive_effect_with_fresh_discovery(monkeypatch, case):
     seen, constructed, loader = default_transport(monkeypatch, case)
     data = assert_meta(call(case), case[-1])
     assert data["status"] == "ok" and data["operation"] == case[1]
-    assert data["returned_rows"] == 1 and data["records"][0]["kind"] == case[5]
+    assert data["returned_rows"] == (3 if case[1] == "GetUserSites" else 1)
+    assert data["records"][0]["kind"] == case[5]
     assert_default_dispatch(case, seen, constructed, loader)
 
 
-def test_injected_reusable_client_retains_explicit_retry_behavior():
+def test_injected_reusable_client_refuses_explicit_retry_before_io():
     seen = []
 
     def upstream(request):
@@ -549,11 +659,8 @@ def test_injected_reusable_client_retains_explicit_retry_behavior():
         return httpx.Response(503 if len(seen) == 1 else 200,
                               json={"d": [QUERY]}, headers={"Retry-After": "0"})
 
-    client = BingReadClient(Loader(), transport=httpx.MockTransport(upstream),
-                            max_retries=1, sleep=lambda _: None)
-    tools.configure_bing_tools(client)
-    data = assert_meta(tools.bing_query_stats(SITE), "weekly")
-    assert tools._client is client and client._max_retries == 1
-    assert data["status"] == "ok" and data["returned_rows"] == 1
-    assert len(seen) == 2
-    assert all(request.url.path.endswith("/GetQueryStats") for request in seen)
+    loader = Loader()
+    with pytest.raises(boundary.BingClientError, match="^invalid_request$"):
+        BingReadClient(loader, transport=httpx.MockTransport(upstream), max_retries=1)
+    assert not seen and loader.loads == 0
+    assert tools._client is None

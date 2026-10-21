@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from ..analytics import expected_ctr, query_search_analytics
 from ...auth import get_webmasters
-from ..dates import lag_days, period, prior_period
 from ...guardrails import with_meta
+from ..analytics import expected_ctr, query_search_analytics
+from ..dates import lag_days, period, prior_period
+from .analytics import _read_client, _run_query
 
 
 def quick_wins(site_url: str, days: int = 28, min_impressions: int = 100, top_n: int = 30) -> dict:
@@ -21,8 +22,8 @@ def quick_wins(site_url: str, days: int = 28, min_impressions: int = 100, top_n:
     where a small ranking improvement could yield disproportionate traffic gains.
     """
     start, end = period(days)
-    rows = query_search_analytics(
-        get_webmasters(), site_url, start, end,
+    rows = _run_query(
+        _read_client(site_url, get_webmasters), query_search_analytics, site_url, start, end,
         dimensions=["query"], row_limit=25000, fetch_all=True,
     )
     target_ctr = expected_ctr(3)
@@ -65,12 +66,14 @@ def traffic_drops(
     """
     cur_s, cur_e = period(days)
     prev_s, prev_e = prior_period(days)
-    wm = get_webmasters()
-    cur = {tuple(r.get("keys", [])): r for r in query_search_analytics(
-        wm, site_url, cur_s, cur_e, dimensions=["page"], row_limit=25000, fetch_all=True,
+    wm = _read_client(site_url, get_webmasters)
+    cur = {tuple(r.get("keys", [])): r for r in _run_query(
+        wm, query_search_analytics, site_url, cur_s, cur_e,
+        dimensions=["page"], row_limit=25000, fetch_all=True,
     )}
-    prev = {tuple(r.get("keys", [])): r for r in query_search_analytics(
-        wm, site_url, prev_s, prev_e, dimensions=["page"], row_limit=25000, fetch_all=True,
+    prev = {tuple(r.get("keys", [])): r for r in _run_query(
+        wm, query_search_analytics, site_url, prev_s, prev_e,
+        dimensions=["page"], row_limit=25000, fetch_all=True,
     )}
 
     drops = []
@@ -147,11 +150,11 @@ def content_decay(site_url: str, top_n: int = 20, min_clicks_p3: int = 10) -> di
     p2 = (p3[0] - timedelta(days=30), p3[0] - timedelta(days=1))
     p1 = (p2[0] - timedelta(days=30), p2[0] - timedelta(days=1))
 
-    wm = get_webmasters()
+    wm = _read_client(site_url, get_webmasters)
 
     def fetch(s: date, e: date):
-        return {tuple(r.get("keys", [])): r for r in query_search_analytics(
-            wm, site_url, s.isoformat(), e.isoformat(),
+        return {tuple(r.get("keys", [])): r for r in _run_query(
+            wm, query_search_analytics, site_url, s.isoformat(), e.isoformat(),
             dimensions=["page"], row_limit=25000, fetch_all=True,
         )}
 
@@ -202,8 +205,8 @@ def cannibalization(
     is not silently filtered out.
     """
     start, end = period(days)
-    rows = query_search_analytics(
-        get_webmasters(), site_url, start, end,
+    rows = _run_query(
+        _read_client(site_url, get_webmasters), query_search_analytics, site_url, start, end,
         dimensions=["query", "page"], row_limit=25000, fetch_all=True,
     )
     bucket: dict[str, list[dict]] = {}
@@ -250,8 +253,8 @@ def ctr_opportunities(
     CTR gap = expected_ctr(pos) - actual_ctr. Tipo "title/meta needs improvement".
     """
     start, end = period(days)
-    rows = query_search_analytics(
-        get_webmasters(), site_url, start, end,
+    rows = _run_query(
+        _read_client(site_url, get_webmasters), query_search_analytics, site_url, start, end,
         dimensions=["page"], row_limit=25000, fetch_all=True,
     )
     out = []
@@ -293,13 +296,13 @@ def alerts(site_url: str, days: int = 7, severity_threshold: str = "warning") ->
     """
     cur_s, cur_e = period(days)
     prev_s, prev_e = prior_period(days)
-    wm = get_webmasters()
-    cur = {tuple(r.get("keys", [])): r for r in query_search_analytics(
-        wm, site_url, cur_s, cur_e,
+    wm = _read_client(site_url, get_webmasters)
+    cur = {tuple(r.get("keys", [])): r for r in _run_query(
+        wm, query_search_analytics, site_url, cur_s, cur_e,
         dimensions=["query", "page"], row_limit=25000, fetch_all=True,
     )}
-    prev = {tuple(r.get("keys", [])): r for r in query_search_analytics(
-        wm, site_url, prev_s, prev_e,
+    prev = {tuple(r.get("keys", [])): r for r in _run_query(
+        wm, query_search_analytics, site_url, prev_s, prev_e,
         dimensions=["query", "page"], row_limit=25000, fetch_all=True,
     )}
 

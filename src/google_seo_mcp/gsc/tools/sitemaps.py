@@ -2,15 +2,29 @@
 from __future__ import annotations
 
 import os
+import time
 
-from ...auth import get_webmasters, is_hosted_production
+from ...auth import (
+    get_google_account_registry,
+    get_webmasters,
+    is_hosted_production,
+    production_writes_disabled,
+)
+from ...google_accounts.models import GoogleRequestDeadline
 from ...guardrails import with_meta
 
 
 def list_sitemaps(site_url: str) -> dict:
     """List sitemaps submitted for a property, with errors/warnings/last-submitted info."""
-    wm = get_webmasters()
-    resp = wm.sitemaps().list(siteUrl=site_url).execute()
+    if is_hosted_production():
+        deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+        executor = get_google_account_registry().router.for_gsc(site_url, deadline)
+        resp = executor.execute(
+            lambda sdk: sdk.gsc.sitemaps().list(siteUrl=site_url).execute(num_retries=0)
+        )
+    else:
+        wm = get_webmasters()
+        resp = wm.sitemaps().list(siteUrl=site_url).execute()
     return with_meta(
         resp.get("sitemap", []), source="webmasters.sitemaps.list", site_url=site_url
     )
@@ -23,7 +37,7 @@ def submit_sitemap(site_url: str, feedpath: str) -> dict:
         site_url: Property URL.
         feedpath: Full sitemap URL (e.g. https://example.com/sitemap.xml).
     """
-    if is_hosted_production():
+    if production_writes_disabled():
         return {
             "error": "destructive_disabled",
             "message": "Sitemap submission is unavailable in hosted production.",

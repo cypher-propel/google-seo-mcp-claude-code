@@ -14,8 +14,8 @@ from importlib.resources import files
 from urllib.parse import urlsplit
 
 PUBLIC_AUTHORITY = "google-seo.mcp.propel.marketing"
-# Independent hosted admission: frozen historical 35 plus the approved eleven Bing reads.
-EXPECTED_TOOLS = frozenset({
+# Independent guard sets; the packaged manifest supplies the current catalog.
+OLD = frozenset({
     "cross_gsc_to_ga4_journey", "cross_landing_page_full_diagnosis",
     "cross_multi_property_comparison", "cross_opportunity_matrix",
     "cross_seo_to_revenue_attribution", "cross_traffic_health_check",
@@ -27,6 +27,8 @@ EXPECTED_TOOLS = frozenset({
     "gsc_ctr_opportunities", "gsc_inspect_url", "gsc_list_sitemaps", "gsc_list_sites",
     "gsc_quick_wins", "gsc_search_analytics", "gsc_site_snapshot", "gsc_traffic_drops",
     "serp_aio_monitor", "serp_check", "serp_competitor_intersect", "serp_paa_extractor",
+})
+BING = frozenset({
     "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats", "bing_page_stats",
     "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
     "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
@@ -94,7 +96,9 @@ async def smoke(options: argparse.Namespace) -> dict[str, str | int]:
     manifest = json.loads(files("google_seo_mcp").joinpath("production_tools.json").read_text())
     expected = manifest["tools"]
     if (
-        manifest["version"] != 1 or set(expected) != EXPECTED_TOOLS
+        manifest["version"] != 1 or not isinstance(expected, list)
+        or any(type(name) is not str for name in expected)
+        or set(expected) != OLD | BING or OLD & BING
         or len(set(expected)) != len(expected)
     ):
         raise SmokeFailure()

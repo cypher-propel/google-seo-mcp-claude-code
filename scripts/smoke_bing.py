@@ -20,6 +20,7 @@ import os
 import re
 import stat
 from datetime import UTC, date, datetime
+from importlib.resources import files
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -112,6 +113,20 @@ class SmokeFailure(Exception):
 class SafeParser(argparse.ArgumentParser):
     def error(self, message):
         raise SmokeFailure("invalid_options")
+
+
+def packaged_catalog():
+    """Derive names from the installed manifest; retain independent old/Bing guards."""
+    doc = json.loads(files("google_seo_mcp").joinpath("production_tools.json").read_text())
+    names = doc["tools"]
+    if (
+        doc["version"] != 1 or type(names) is not list
+        or any(type(name) is not str for name in names)
+        or len(names) != len(set(names)) or OLD & frozenset(BING)
+        or set(names) != EXPECTED
+    ):
+        raise SmokeFailure("catalog_manifest_mismatch")
+    return frozenset(names)
 
 
 def validate_target(target, pilot):
@@ -336,6 +351,10 @@ async def business(session, receipt, options, *, token):
             staleness="unqualified_no_freshness_SLA",
             completeness="unknown",
         )
+        # A partial MCP success can still carry a typed provider/rate fault.
+        # Keep its sanitized result and consume this name, then STOP; no replay.
+        if data["error"] is not None:
+            raise SmokeFailure("provider_not_qualified")
         return data
 
     discovery = await call(BING[0], {})
@@ -483,6 +502,7 @@ async def run(options, *, transport=None):
     token = ""
     try:
         qualified = validate_options(options)
+        expected = packaged_catalog()  # Before bearer lookup or network.
         if qualified:
             receipt["trusted_operator_preflight"] = {
                 k: v for k, v in qualified.items() if k != "authorization"
@@ -493,8 +513,11 @@ async def run(options, *, transport=None):
                 enrollment_record=qualified["authorization"]["coordinator_key_enrolled_record"],
                 enrollment_at=qualified["authorization"]["key_enrolled_at"],
             )
-            receipt["attempt_bound_basis"] = "parent_readback_zero_retry_composition_not_SDK_count"
-            receipt["qualified_upstream_attempts_upper_bound"] = 11
+            receipt["attempt_bound_basis"] = (
+                "parent_readback_zero_retry_1_listing_plus_10_fresh_discovery_and_business_not_SDK_count"
+            )
+            # Theoretical full-sequence bound, NOT observed sends or budget authority.
+            receipt["qualified_upstream_attempts_upper_bound"] = 21
         if transport is not None and not options.synthetic:
             raise SmokeFailure("fixture_transport_requires_synthetic")
         if options.synthetic and transport is None:
@@ -561,7 +584,7 @@ async def run(options, *, transport=None):
         ):
             await session.initialize()
             names, cursors, cursor = [], set(), None
-            for _ in range(47):
+            for _ in range(len(expected) + 1):
                 listed = await session.list_tools(cursor=cursor)
                 names.extend(t.name for t in listed.tools)
                 cursor = listed.nextCursor
@@ -572,8 +595,8 @@ async def run(options, *, transport=None):
                 cursors.add(cursor)
             else:
                 raise SmokeFailure("catalog_page_budget")
-            if len(names) != 46 or set(names) != EXPECTED:
-                raise SmokeFailure("catalog_not_exact_46")
+            if len(names) != len(expected) or set(names) != expected:
+                raise SmokeFailure("catalog_not_exact_manifest")
             receipt["catalog_count"] = len(names)
             # Pending means ZERO tools/call, including discovery/fence probes.
             if options.synthetic or options.live:
@@ -634,7 +657,7 @@ def synthetic_transport():
             }
         elif method == "tools/list":
             result = {
-                "tools": [{"name": n, "inputSchema": {"type": "object"}} for n in sorted(EXPECTED)]
+                "tools": [{"name": n, "inputSchema": {"type": "object"}} for n in sorted(packaged_catalog())]
             }
         else:
             # No fabricated provider rows: default dry run aborts discovery as empty.

@@ -3,9 +3,9 @@
 Composition captures paths without I/O. The first local boundary captures file
 fingerprints; subsequent changes fail closed, including changes after absence.
 No key is cached here and no network/client construction belongs in this module.
-Each inspection owns both original leaves/chains before any read, retains them
-through parsing and pair admission, then closes every handle before publication.
-The final sweep is sequential, not an atomic two-file filesystem transaction:
+Each inspection retains the original key leaf/chain through parsing and local
+admission, then attempts every close before publication. No policy is read.
+The final sweep is sequential, not an atomic filesystem transaction:
 each object's last observation bounds its guarantee. Changes after that check,
 or restored histories leaving no compared metadata difference, are not detected.
 The boundary lock serializes inspectors, not filesystem writers.
@@ -19,13 +19,12 @@ import stat
 import threading
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from uuid import uuid4
 
-from .models import BingCredentialDocument, BingSitePolicy
+from .models import BingCredentialDocument
 
 BingCredentialsState = Literal["pending", "invalid", "available"]
-_APPROVED_SITES = frozenset({"https://kelleyconstructioninc.com/"})
 _DEFAULT_KEY = "/run/secrets/bing-webmaster.json"
-_DEFAULT_POLICY = "/run/secrets/bing-sites.json"
 
 
 class BingAuthError(RuntimeError):
@@ -39,10 +38,9 @@ class BingAuthError(RuntimeError):
 class IBingCredentialLoader(Protocol):
     def load(self) -> BingCredentialDocument: ...
 
-    @property
-    def allowed_sites(self) -> frozenset[str]: ...
+    def generation(self) -> str: ...
 
-    def authorize_site(self, site_url: str) -> None: ...
+    def require_generation(self, expected: str) -> None: ...
 
 
 def _unique_object(pairs):
@@ -137,9 +135,8 @@ class _HeldDocument:
             if length > self.cap:
                 raise ValueError("invalid_file")
             self.document = self.model.model_validate(
-                json.loads(b"".join(chunks), object_pairs_hook=_unique_object))
-            if self.model is BingSitePolicy and frozenset(self.document.sites) != _APPROVED_SITES:
-                raise ValueError("invalid_policy")
+                json.loads(b"".join(chunks).decode("utf-8", errors="strict"),
+                           object_pairs_hook=_unique_object))
         except Exception:
             self.state = "invalid"
             self.document = None
@@ -174,9 +171,9 @@ class _Boundary:
     def __init__(self, config: Any):
         # Defaults are the approved runtime defaults; explicit None stays absent.
         key = getattr(config, "bing_credentials_file", _DEFAULT_KEY)
-        policy = getattr(config, "bing_sites_file", _DEFAULT_POLICY)
         self.key = Path(key) if key else None
-        self.policy = Path(policy) if policy else None
+        # Opaque composition identity, never derived from credential material.
+        self.generation = uuid4().hex
         self.lock = threading.RLock()
         self.snapshot = None
         self.invalidated = False
@@ -188,32 +185,33 @@ class _Boundary:
                 return "invalid", None
             descriptors = []
             key = _HeldDocument(self.key, 16384, BingCredentialDocument)
-            policy = _HeldDocument(self.policy, 65536, BingSitePolicy)
             result = ("invalid", None)
             cleanup_failed = False
             cleanup_cancelled = None
+            request_control = None
             try:
-                # Fixed acquisition order; BOTH original baselines precede ANY read.
-                for held in (key, policy):
-                    held.acquire(descriptors)
-                for held in (key, policy):
-                    held.read_candidate()
-                for held in (key, policy):
-                    held.observe(descriptors)
-                current = (key.state, key.signature(), policy.state, policy.signature())
+                key.acquire(descriptors)
+                key.read_candidate()
+                key.observe(descriptors)
+                current = (key.state, key.signature())
                 if self.snapshot is None:
                     self.snapshot = current
                 elif current != self.snapshot:
                     self.invalidated = True
-                if "invalid" in (key.state, policy.state):
+                if key.state == "invalid":
                     self.invalidated = self.custody_failed = True
-                elif "pending" in (key.state, policy.state):
+                elif key.state == "pending":
                     result = ("pending", None)
                 elif not self.invalidated:
-                    # Logical admission with ALL original/verification handles held.
+                    # Logical admission with original/verification handles held.
                     # Each final observation has its own instant: this is NOT an
-                    # atomic pair transaction or protection after the last check.
+                    # atomic transaction or protection after the last check.
                     result = ("available", key.document)
+            except BaseException as error:
+                # Explicit local unwind state: ambient caller handlers are irrelevant.
+                if not isinstance(error, Exception):
+                    request_control = error
+                raise
             finally:
                 for fd in reversed(descriptors):
                     try:
@@ -224,7 +222,7 @@ class _Boundary:
                             cleanup_cancelled = error
                 if cleanup_failed:
                     self.invalidated = self.custody_failed = True
-                if cleanup_cancelled is not None:
+                if request_control is None and cleanup_cancelled is not None:
                     raise cleanup_cancelled
             if cleanup_failed:
                 return "invalid", None
@@ -262,19 +260,31 @@ class BingCredentialLoader:
     def load(self) -> BingCredentialDocument:
         state, document = self._boundary.inspect() if self._boundary else ("pending", None)
         if state != "available":
-            raise BingAuthError("credentials_missing" if state == "pending"
-                                else "credentials_invalid")
+            _refuse("credentials_missing" if state == "pending" else "credentials_invalid")
         return document
 
-    @property
-    def allowed_sites(self) -> frozenset[str]:
+    def generation(self) -> str:
+        """Fresh local custody observation, not provider grants or cached readiness."""
         self.load()
-        return _APPROVED_SITES
+        return self._boundary.generation
 
-    def authorize_site(self, site_url: str) -> None:
-        self.load()
-        if site_url not in _APPROVED_SITES:
-            raise BingAuthError("site_denied")
+    def require_generation(self, expected: str) -> None:
+        """Reinspect after blocking transport entry before a future client dispatch.
+
+        Compare to the raw/discovery generation; no atomic filesystem/network
+        guarantee is implied. This seam does not implement the client's gate.
+        """
+        if self.generation() != expected:
+            _refuse("credentials_invalid")
+
+
+def _refuse(code):
+    # from None hides context but retains it; clear only this normalized error.
+    try:
+        raise BingAuthError(code) from None
+    except BingAuthError as error:
+        error.__context__ = None
+        raise
 
 
 def bing_credentials_state() -> BingCredentialsState:

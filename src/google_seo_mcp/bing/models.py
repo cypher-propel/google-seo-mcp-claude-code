@@ -4,7 +4,7 @@ import re
 from datetime import date, datetime
 from enum import StrEnum
 from ipaddress import ip_address
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol, runtime_checkable
 from urllib.parse import unquote, urlsplit
 
 from pydantic import (
@@ -253,24 +253,38 @@ class BingCredentialDocument(BingModel):
         return value
 
 
-class BingSitePolicy(BingModel):
-    version: Literal[1]
-    sites: Annotated[list[str], Field(min_length=1, max_length=1000, repr=False)]
+@runtime_checkable
+class BingBudget(Protocol):
+    """View of ONE caller's combined real/injected deadline, never a new timer.
 
-    _strict_version = field_validator("version", mode="before")(
-        BingCredentialDocument.strict_version.__func__
-    )
+    remaining is nonnegative, zero on expiry/cancellation. cancel is idempotent
+    and must prevent later dispatch through the concrete client's gates.
+    """
 
-    @field_validator("sites")
-    @classmethod
-    def valid_sites(cls, sites):
-        if len(set(sites)) != len(sites):
-            raise ValueError("duplicate_sites")
-        for site in sites:
-            validate_public_url(site)
-            if urlsplit(site).query:
-                raise ValueError("invalid_property")
-        return sites
+    def remaining(self) -> float: ...
+
+    def cancel(self) -> None: ...
+
+
+class BingRawResponse(BingModel):
+    """Private, bounded transfer AFTER key-aware reflection checks by the client.
+
+    Not an outward result: every field is excluded from repr and serialization.
+    No key, headers, request object or foreign exception crosses this seam.
+    This record does not itself certify provider JSON or grant authority.
+    """
+
+    status_code: int = Field(repr=False, exclude=True)
+    retry_after: Annotated[str, Field(max_length=2048)] | None = Field(repr=False, exclude=True)
+    body: Annotated[bytes, Field(max_length=2 * 1024 * 1024)] = Field(repr=False, exclude=True)
+    credential_generation: Annotated[str, Field(min_length=1, max_length=128)] = Field(
+        repr=False, exclude=True)
+
+
+class BingRawAttempt(Protocol):
+    """Nonrecursive raw primitive; uses the caller's existing budget instance."""
+
+    def __call__(self, request: BingToolRequest, budget: BingBudget) -> BingRawResponse: ...
 
 
 SafeCode = Literal[
@@ -309,6 +323,43 @@ class BingPeriod(BingModel):
 
 class BingSiteRecord(RawBingSite):
     kind: Literal["site"] = "site"
+
+
+class BingDiscoverySnapshot(BingModel):
+    """Private request-local admission, NOT provider inventory completeness.
+
+    A partial local parse never authorizes, even an otherwise valid true row.
+    Wire completeness remains unknown; no cache or I/O occurs in validation.
+    Explicit projection into BingReadResult belongs to the consumer, not dump().
+    """
+
+    credential_generation: Annotated[str, Field(min_length=1, max_length=128)] = Field(
+        repr=False, exclude=True)
+    listed_sites: tuple[BingSiteRecord, ...] = Field(repr=False, exclude=True)
+    eligible_sites: frozenset[str] = Field(repr=False, exclude=True)
+    invalid_rows: Count = Field(repr=False, exclude=True)
+    complete: bool = Field(repr=False, exclude=True)
+
+    @model_validator(mode="after")
+    def local_admission(self):
+        seen, eligible = set(), set()
+        for row in self.listed_sites:
+            # Revalidate unchecked nested model instances without warning output.
+            checked = BingSiteRecord.model_validate(row.model_dump(warnings=False))
+            validate_public_url(checked.url)
+            if urlsplit(checked.url).query or checked.url in seen:
+                raise ValueError("invalid_discovery_snapshot")
+            seen.add(checked.url)
+            if checked.is_verified is True:
+                eligible.add(checked.url)
+        if (self.complete and self.invalid_rows
+                or self.eligible_sites != (frozenset(eligible) if self.complete else frozenset())):
+            raise ValueError("invalid_discovery_snapshot")
+        return self
+
+
+class IBingSiteDiscovery(Protocol):
+    def discover(self, deadline: BingBudget) -> BingDiscoverySnapshot: ...
 
 
 class BingTrafficRecord(RawBingTrafficStats):

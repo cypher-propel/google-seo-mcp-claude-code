@@ -70,7 +70,12 @@ def _read(operation: BingOperation, **inputs) -> dict:
 
 
 def bing_list_sites() -> dict:
-    """List only approved verified Bing properties; omit verification codes."""
+    """List valid provider-listed Bing properties, including unverified entries.
+
+    Verification codes are omitted; provider completeness remains unknown.
+    Business reads require exact membership with strict IsVerified=true in fresh
+    discovery; listing alone does not establish read eligibility or permission.
+    """
     return _read(BingOperation.GET_USER_SITES)
 
 

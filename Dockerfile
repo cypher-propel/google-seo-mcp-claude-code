@@ -26,20 +26,23 @@ RUN python -m pip wheel --index-url https://pypi.org/simple \
       --require-hashes --no-build-isolation --no-deps \
       --wheel-dir /wheelhouse -r requirements-production.lock
 
-# Install the exact qualified archive, never regenerate an application wheel.
-# Compare all package/data members with this build context to reject stale input.
-COPY deploy/image-build/google_seo_mcp-0.8.5-py3-none-any.whl ./
+# Build the application from THIS context using only the pinned builder tools.
+# Freeze its digest before installation; reject any package/data member drift.
+COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
-RUN python -c 'from pathlib import Path; import hashlib,zipfile; p=Path("google_seo_mcp-0.8.5-py3-none-any.whl"); assert hashlib.sha256(p.read_bytes()).hexdigest()=="23445d0fc4331fc9553a4c57e650268bc4ca4069af6bfd0abdce1d61c1f202d0", "Unqualified application archive"; z=zipfile.ZipFile(p); members={n:z.read(n) for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")}; source={p.relative_to("src").as_posix():p.read_bytes() for p in Path("src/google_seo_mcp").rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix not in {".pyc",".pyo"}}; assert len(z.namelist())==83 and len(members)==77; assert members==source, "Qualified archive differs from source/data"' \
+ARG SOURCE_DATE_EPOCH=0
+RUN python -m pip wheel --no-index --no-build-isolation --no-deps --wheel-dir /application . \
+    && python -c 'from pathlib import Path; import hashlib,json,zipfile; wheels=list(Path("/application").glob("*.whl")); assert len(wheels)==1; p=wheels[0]; assert p.name=="google_seo_mcp-0.8.5-py3-none-any.whl"; z=zipfile.ZipFile(p); assert len(z.namelist())==len(set(z.namelist())); members={n:z.read(n) for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")}; source={p.relative_to("src").as_posix():p.read_bytes() for p in Path("src/google_seo_mcp").rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix not in {".pyc",".pyo"}}; assert members and members==source, "Built archive differs from source/data"; Path("/application/application.sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n"); Path("/application/source-members.json").write_text(json.dumps({n:hashlib.sha256(b).hexdigest() for n,b in sorted(source.items())},sort_keys=True)+"\n")' \
     && python -m venv --without-pip /opt/venv \
     && mkdir -p /opt/venv/share/qualified-application \
-    && cp google_seo_mcp-0.8.5-py3-none-any.whl /opt/venv/share/qualified-application/ \
+    && cp /application/* /opt/venv/share/qualified-application/ \
+    && cd /opt/venv/share/qualified-application && sha256sum -c application.sha256 && cd /build \
     && python -c 'from pathlib import Path; import hashlib; wheels=sorted(Path("/wheelhouse").glob("*.whl")); assert len(wheels)==74 and not any(p.name.lower().startswith("pip-") for p in wheels); wheels.append(Path("/opt/venv/share/qualified-application/google_seo_mcp-0.8.5-py3-none-any.whl")); Path("/wheelhouse/runtime-wheels.lock").write_text("".join(str(p)+" --hash=sha256:"+hashlib.sha256(p.read_bytes()).hexdigest()+"\n" for p in wheels))' \
     && python -m pip --python /opt/venv/bin/python install \
       --no-index --no-deps --require-hashes -r /wheelhouse/runtime-wheels.lock \
     && python -m pip --python /opt/venv/bin/python check \
     && /opt/venv/bin/python -c 'from importlib.metadata import distributions; from importlib.util import find_spec; from pathlib import Path; names={d.metadata["Name"].lower().replace("_","-") for d in distributions()}; assert len(names)==75; assert find_spec("pip") is None; assert not list(Path("/opt/venv/bin").glob("pip*")); assert not names.intersection({"pip","advertools","scrapy","twisted","setuptools","wheel","packaging","build","pip-tools","pip-audit","pytest","ruff","playwright","scipy","statsmodels"})' \
-    && /opt/venv/bin/python -c 'from pathlib import Path; import sysconfig,zipfile; z=zipfile.ZipFile("/opt/venv/share/qualified-application/google_seo_mcp-0.8.5-py3-none-any.whl"); root=Path(sysconfig.get_path("purelib")); members=[n for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")]; assert len(members)==77; assert all((root/n).read_bytes()==z.read(n) for n in members), "Installed application differs from qualified archive"' \
+    && /opt/venv/bin/python -c 'from pathlib import Path; import sysconfig,zipfile; z=zipfile.ZipFile("/opt/venv/share/qualified-application/google_seo_mcp-0.8.5-py3-none-any.whl"); root=Path(sysconfig.get_path("purelib")); members=[n for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")]; manifest=__import__("json").loads(Path("/opt/venv/share/qualified-application/source-members.json").read_text()); assert members and set(members)==set(manifest); assert all(__import__("hashlib").sha256(z.read(n)).hexdigest()==manifest[n] and (root/n).read_bytes()==z.read(n) for n in members), "Installed application differs from built source/archive"' \
     && cp /wheelhouse/runtime-wheels.lock /opt/venv/share/runtime-wheels.lock
 
 FROM python:3.11-slim-bookworm@sha256:8a00ecb83ed9d0864dfd102a1bdb2067fda907ceb30bb86d09da9ee558b19590 AS runtime
@@ -72,12 +75,14 @@ ENV PATH=/opt/venv/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     GOOGLE_SEO_PROFILE=production \
-    GOOGLE_SEO_AUTH_MODE=service-account \
+    GOOGLE_SEO_AUTH_MODE=dual-user-oauth \
     GOOGLE_SEO_HOST=0.0.0.0 \
     GOOGLE_SEO_PORT=8000 \
     GOOGLE_SEO_CONSUMER_KEYS_FILE=/run/secrets/consumer-keys.json \
-    GOOGLE_SEO_SERVICE_ACCOUNT_FILE=/run/secrets/google-seo-service-account.json \
-    GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS=false \
+    GOOGLE_SEO_OAUTH_CLIENT_FILE=/run/secrets/google-seo-oauth-client.json \
+    GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE=/run/secrets/google-seo-oauth-propel-dms.json \
+    GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE=/run/secrets/google-seo-oauth-addourteam99.json \
+    GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS=true \
     GSC_ALLOW_DESTRUCTIVE=false \
     GOOGLE_SEO_ALLOW_INDEXNOW=false \
     GOOGLE_SEO_ALLOW_LOCAL_FILES=false \

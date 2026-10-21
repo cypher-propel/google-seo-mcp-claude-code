@@ -16,7 +16,7 @@ PRIVATE = "SYNTHETIC_LOGGING_PRIVATE_VALUE"
 BOOT = r'''
 import asyncio, hashlib, json, logging, socket, sys
 from google_seo_mcp import server, auth
-from google_seo_mcp.runtime_config import load_runtime_config
+from google_seo_mcp.runtime_config import ProductionRuntimeConfig, load_runtime_config
 from google_seo_mcp.consumer_auth import (
     AuthenticatedConsumer, ConsumerKeyRegistry, ConsumerKeyEdgeMiddleware,
     consumer_context, request_id_context,
@@ -29,7 +29,16 @@ socket.getaddrinfo = forbidden
 socket.socket.connect = forbidden
 socket.socket.connect_ex = forbidden
 PRIVATE = 'SYNTHETIC_LOGGING_PRIVATE_VALUE'
-hosted = load_runtime_config(['--transport', 'streamable-http'], {})
+hosted = ProductionRuntimeConfig(
+    transport='streamable-http', profile='production',
+    google_auth_mode='dual-user-oauth',
+    google_approved_client_id='synthetic.apps.googleusercontent.com',
+    google_approved_project_id='synthetic-project',
+    google_oauth_client_file='/client.json',
+    google_oauth_propel_dms_file='/propel-dms.json',
+    google_oauth_addourteam99_file='/addourteam99.json',
+    consumer_keys_file='/unused-consumers.json',
+)
 instance = server.create_server(hosted)
 '''
 
@@ -58,37 +67,116 @@ def probe(tmp_path, code, scope=None):
 @pytest.mark.parametrize("severity", ["warning", "error", "exception"])
 def test_real_offline_constructors_cannot_reopen_logging(tmp_path, scope, client, severity):
     code = r'''
-from google.auth.credentials import AnonymousCredentials
+import os, time
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs
+import requests
+from google.oauth2.credentials import Credentials
 from google.api_core import client_logging
-# Reset only the SDK's once flag: its actual constructor logging setup executes.
-client_logging._LOGGING_INITIALIZED = False
-auth._build_creds = lambda: AnonymousCredentials()
-seen = []
+from google_seo_mcp.google_accounts import clients, credentials as custody
+from google_seo_mcp.google_accounts.models import (
+    ACCOUNT_IDS, GOOGLE_SCOPES, TOKEN_URI, GoogleAccountError, GoogleRequestDeadline,
+)
+# Synthetic documents, not enrolled identities. Redirect only the descriptor
+# walk's root to empty HOME; real leaf/owner/mode/read/binding checks still run.
+root = Path(os.environ['HOME'])
+root.chmod(0o700)
+client_id = hosted.google_approved_client_id
+client_secret = PRIVATE + '-client'
+records = {'client.json': {'installed': {
+    'client_id': client_id, 'client_secret': client_secret,
+    'project_id': hosted.google_approved_project_id,
+    'auth_uri': 'https://accounts.google.com/o/oauth2/v2/auth', 'token_uri': TOKEN_URI,
+}}}
+for account in ACCOUNT_IDS:
+    records[account + '.json'] = {
+        'version': 1, 'account_id': account, 'client_id': client_id,
+        'client_secret': client_secret, 'refresh_token': PRIVATE + '-' + account,
+        'token_uri': TOKEN_URI, 'scopes': sorted(GOOGLE_SCOPES),
+    }
+for name, record in records.items():
+    path = root / name
+    path.write_text(json.dumps(record), encoding='utf-8')
+    path.chmod(0o600)
+original_open = os.open
+def fixture_open(path, flags, *args, **kwargs):
+    return original_open(str(root) if path == '/' else path, flags, *args, **kwargs)
+seen, sends = [], []
 def stopped_transport(**kwargs):
-    seen.append(True)
+    seen.append(kwargs['credentials'].refresh_token)
     raise RuntimeError('offline_transport_stopped')
-if CLIENT in ('data', 'admin'):
-    factory = auth.BetaAnalyticsDataClient if CLIENT == 'data' else auth.AnalyticsAdminServiceClient
-    try:
-        auth._hosted_client(factory, transport=stopped_transport)
-    except RuntimeError as error:
-        assert error.args == ('google_client_unavailable',)
-    else:
-        raise AssertionError('transport_not_stopped')
-    assert seen == [True]
-    assert client_logging._LOGGING_INITIALIZED is True
-else:
-    getter = auth.get_searchconsole if CLIENT == 'searchconsole' else auth.get_webmasters
-    service = getter()
+# Keep real SDK __init__/logging setup. Only the selected GAPIC transport
+# factory is stopped, after the registry has built its real REST transports.
+factory_name = 'BetaAnalyticsDataClient' if CLIENT == 'data' else 'AnalyticsAdminServiceClient'
+factory = getattr(clients, factory_name)
+def stopped_client(*, transport):
+    return factory(credentials=transport._credentials, transport=stopped_transport)
+def wire(adapter, request, **kwargs):
+    assert request.method == 'POST' and request.url == TOKEN_URI
+    assert kwargs['proxies'] == {} and kwargs['stream'] is True
+    assert 0 < kwargs['timeout'] <= 15
+    body = parse_qs(request.body.decode() if isinstance(request.body, bytes) else request.body)
+    account = next(account for account in ACCOUNT_IDS
+                   if body['refresh_token'] == [PRIVATE + '-' + account])
+    assert body['client_id'] == [client_id]
+    assert body['client_secret'] == [client_secret]
+    assert frozenset(body['scope'][0].split()) == GOOGLE_SCOPES
+    sends.append(account)
+    response = requests.Response()
+    response.status_code = 200
+    response.url = request.url
+    response.headers['Content-Type'] = 'application/json'
+    response._content = json.dumps({
+        'access_token': PRIVATE + '-access-' + account,
+        'token_type': 'Bearer', 'expires_in': 3600,
+        'scope': ' '.join(sorted(GOOGLE_SCOPES)),
+    }).encode()
+    response._content_consumed = True
+    return response
+registry = auth.get_google_account_registry()
+def inspect_sdk(sdk):
+    assert sdk.account_id == account
+    service = sdk.gsc._inspection if CLIENT == 'searchconsole' else sdk.gsc._webmasters
     assert service._rootDesc['name'] == CLIENT
-    assert service._http.credentials.__class__ is AnonymousCredentials
-# Do not reset logging after real constructor execution.
-logger = logging.getLogger('google.analytics.transport.late')
-try:
-    raise RuntimeError(PRIVATE)
-except RuntimeError:
-    getattr(logger, SEVERITY)(PRIVATE, extra={'credentialsInfo': PRIVATE, 'metadata': PRIVATE})
-assert attempts == []
+    credential = service._http._session._credentials
+    assert type(credential) is Credentials
+    assert credential.client_id == client_id
+    assert credential.refresh_token == PRIVATE + '-' + account
+    assert frozenset(credential.scopes) == GOOGLE_SCOPES
+    return None  # No SDK object escapes the account execution boundary.
+with patch.object(custody.os, 'open', fixture_open), patch.object(requests.adapters.HTTPAdapter, 'send', wire):
+    try:
+        assert tuple(c.account_id for c in registry.loader.load_accounts()) == ACCOUNT_IDS
+        for account in ACCOUNT_IDS:
+            # Reset only the SDK once flag before each identity's real setup.
+            client_logging._LOGGING_INITIALIZED = False
+            deadline = GoogleRequestDeadline(end=time.monotonic() + 20)
+            if CLIENT in ('data', 'admin'):
+                with patch.object(clients, factory_name, stopped_client):
+                    try:
+                        registry.clients.execute(account, inspect_sdk, deadline)
+                    except GoogleAccountError as error:
+                        assert error.args == ('agency_discovery_incomplete',)
+                    else:
+                        raise AssertionError('transport_not_stopped')
+                assert seen[-1:] == [PRIVATE + '-' + account]
+            else:
+                assert registry.clients.execute(account, inspect_sdk, deadline) is None
+            assert client_logging._LOGGING_INITIALIZED is True
+        assert seen == ([PRIVATE + '-' + account for account in ACCOUNT_IDS]
+                        if CLIENT in ('data', 'admin') else [])
+        assert sends == ([] if CLIENT in ('data', 'admin') else list(ACCOUNT_IDS))
+        # Do not reset logging after real constructor execution.
+        logger = logging.getLogger('google.analytics.transport.late')
+        try:
+            raise RuntimeError(PRIVATE)
+        except RuntimeError:
+            getattr(logger, SEVERITY)(PRIVATE, extra={'credentialsInfo': PRIVATE, 'metadata': PRIVATE})
+        assert attempts == []
+    finally:
+        # Revocation retires every real bundle/session, including both slots.
+        registry.retire()
 print('constructor_executed_no_outbound')
 '''.replace("CLIENT", repr(client)).replace("SEVERITY", repr(severity))
     result = probe(tmp_path, code, scope)

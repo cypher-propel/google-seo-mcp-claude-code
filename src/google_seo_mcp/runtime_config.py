@@ -67,25 +67,41 @@ class ProductionRuntimeConfig(BaseModel):
     accepted_origins: tuple[str, ...] = ()
     consumer_keys_file: Path | None = Field(default=None, repr=False)
     service_account_file: Path | None = Field(default=None, repr=False)
-    google_auth_mode: Literal["legacy", "service-account"] = "legacy"
-    require_google_credentials: bool = False
+    google_auth_mode: Literal["legacy", "dual-user-oauth"] = "legacy"
+    google_oauth_client_file: Path = Field(
+        default=Path("/run/secrets/google-seo-oauth-client.json"), repr=False
+    )
+    google_oauth_propel_dms_file: Path = Field(
+        default=Path("/run/secrets/google-seo-oauth-propel-dms.json"), repr=False
+    )
+    google_oauth_addourteam99_file: Path = Field(
+        default=Path("/run/secrets/google-seo-oauth-addourteam99.json"), repr=False
+    )
+    google_approved_client_id: str | None = Field(default=None, repr=False)
+    google_approved_project_id: str | None = Field(default=None, repr=False)
+    require_google_credentials: bool = Field(default=False, strict=True)
     bing_credentials_file: Path = Field(
         default=Path("/run/secrets/bing-webmaster.json"), repr=False
     )
-    bing_sites_file: Path = Field(default=Path("/run/secrets/bing-sites.json"), repr=False)
     require_bing_credentials: bool = Field(default=False, strict=True)
-    allow_indexnow: bool = False
-    allow_local_files: bool = False
-    allow_private_fetch: bool = False
-    allow_destructive: bool = False
-    debug: bool = False
+    allow_indexnow: bool = Field(default=False, strict=True)
+    allow_local_files: bool = Field(default=False, strict=True)
+    allow_private_fetch: bool = Field(default=False, strict=True)
+    allow_destructive: bool = Field(default=False, strict=True)
+    debug: bool = Field(default=False, strict=True)
 
-    @field_validator("bing_credentials_file", "bing_sites_file", mode="before")
+    @field_validator(
+        "bing_credentials_file", "consumer_keys_file", "service_account_file",
+        "google_oauth_client_file", "google_oauth_propel_dms_file",
+        "google_oauth_addourteam99_file", mode="before"
+    )
     @classmethod
-    def validate_bing_path(cls, value: object) -> Path:
+    def validate_path(cls, value: object) -> Path | None:
         # Lexical validation only: custody/existence checks belong to the lazy loader.
+        if value is None:
+            return None
         if not isinstance(value, (str, Path)):
-            raise ValueError("invalid Bing configuration path")
+            raise ValueError("invalid configuration path")
         text = str(value)
         if (
             not text.startswith("/")
@@ -94,8 +110,18 @@ class ProductionRuntimeConfig(BaseModel):
             or "\\" in text
             or any(0xD800 <= ord(c) <= 0xDFFF for c in text)
         ):
-            raise ValueError("invalid Bing configuration path")
+            raise ValueError("invalid configuration path")
         return Path(text)
+
+    @field_validator("google_approved_client_id", "google_approved_project_id")
+    @classmethod
+    def validate_binding(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not 0 < len(value) <= 4096 or not value.isascii()
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
+        ):
+            raise ValueError("invalid approved binding")
+        return value
 
     @field_validator("host")
     @classmethod
@@ -130,8 +156,18 @@ class ProductionRuntimeConfig(BaseModel):
         if self.transport == "streamable-http" and self.profile != "production":
             raise ValueError("HTTP requires production profile")
         if self.profile == "production":
-            if self.google_auth_mode != "service-account":
-                raise ValueError("production requires service-account mode")
+            if self.google_auth_mode != "dual-user-oauth" or self.service_account_file is not None:
+                raise ValueError("production requires exclusive dual-user-oauth mode")
+            paths = (self.google_oauth_client_file, self.google_oauth_propel_dms_file,
+                     self.google_oauth_addourteam99_file)
+            if len(set(paths)) != 3:
+                raise ValueError("production requires distinct credential paths")
+            if bool(self.google_approved_client_id) != bool(self.google_approved_project_id):
+                raise ValueError("production requires complete approved binding")
+            if self.google_approved_client_id is not None and not self.google_approved_client_id.endswith(
+                ".apps.googleusercontent.com"
+            ):
+                raise ValueError("invalid approved client")
             if any(
                 (
                     self.allow_indexnow,
@@ -142,8 +178,10 @@ class ProductionRuntimeConfig(BaseModel):
                 )
             ):
                 raise ValueError("production forbids unsafe gates")
-            if self.service_account_file is None or self.consumer_keys_file is None:
+            if self.consumer_keys_file is None:
                 raise ValueError("production requires configured credential paths")
+        elif self.google_auth_mode != "legacy":
+            raise ValueError("legacy requires legacy authentication")
         if not self.accepted_hosts:
             public = urlsplit(self.public_base_url).netloc
             object.__setattr__(
@@ -192,20 +230,26 @@ def load_runtime_config(
                 "GOOGLE_SEO_PUBLIC_BASE_URL", "https://google-seo.mcp.propel.marketing"
             ),
             "google_auth_mode": environment.get(
-                "GOOGLE_SEO_AUTH_MODE", "service-account" if profile == "production" else "legacy"
+                "GOOGLE_SEO_AUTH_MODE", "dual-user-oauth" if profile == "production" else "legacy"
             ),
             "consumer_keys_file": environment.get("GOOGLE_SEO_CONSUMER_KEYS_FILE")
             or ("/run/secrets/consumer-keys.json" if profile == "production" else None),
-            "service_account_file": environment.get("GOOGLE_SEO_SERVICE_ACCOUNT_FILE")
-            or (
-                "/run/secrets/google-seo-service-account.json" if profile == "production" else None
+            "service_account_file": environment.get("GOOGLE_SEO_SERVICE_ACCOUNT_FILE"),
+            "google_oauth_client_file": environment.get(
+                "GOOGLE_SEO_OAUTH_CLIENT_FILE", "/run/secrets/google-seo-oauth-client.json"
             ),
+            "google_oauth_propel_dms_file": environment.get(
+                "GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE", "/run/secrets/google-seo-oauth-propel-dms.json"
+            ),
+            "google_oauth_addourteam99_file": environment.get(
+                "GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE", "/run/secrets/google-seo-oauth-addourteam99.json"
+            ),
+            "google_approved_client_id": environment.get("GOOGLE_SEO_APPROVED_CLIENT_ID"),
+            "google_approved_project_id": environment.get("GOOGLE_SEO_APPROVED_PROJECT_ID"),
             "bing_credentials_file": environment.get(
                 "GOOGLE_SEO_BING_CREDENTIALS_FILE", "/run/secrets/bing-webmaster.json"
             ),
-            "bing_sites_file": environment.get(
-                "GOOGLE_SEO_BING_SITES_FILE", "/run/secrets/bing-sites.json"
-            ),
+
         }
         for field, variable in (
             ("accepted_hosts", "GOOGLE_SEO_ACCEPTED_HOSTS"),

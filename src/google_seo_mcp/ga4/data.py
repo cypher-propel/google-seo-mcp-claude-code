@@ -7,6 +7,7 @@ GA4 returns `row_count` even when `limit=1`, so we can estimate result size for
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from google.analytics.data_v1beta.types import (
@@ -24,7 +25,13 @@ from google.analytics.data_v1beta.types import (
 )
 from google.api_core.exceptions import GoogleAPIError
 
-from ..auth import get_data_client, normalize_property
+from ..auth import (
+    get_data_client,
+    get_google_account_registry,
+    is_hosted_production,
+    normalize_property,
+)
+from ..google_accounts.models import GoogleRequestDeadline
 
 log = logging.getLogger(__name__)
 
@@ -139,8 +146,12 @@ def run_report(
         getattr(MetricAggregation, a, MetricAggregation.TOTAL) for a in (aggregations or [])
     ]
 
+    executor = None
+    if is_hosted_production():
+        deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+        executor = get_google_account_registry().router.for_ga4(property_id, deadline)
     req = RunReportRequest(
-        property=normalize_property(property_id),
+        property=executor.property_id if executor is not None else normalize_property(property_id),
         date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
         dimensions=_build_dimensions(dimensions),
         metrics=_build_metrics(metrics),
@@ -152,6 +163,8 @@ def run_report(
         metric_aggregations=metric_aggregations,
         return_property_quota=return_property_quota,
     )
+    if executor is not None:
+        return executor.execute(lambda sdk: _serialize_response(sdk.ga4_data.run_report(req)))
     try:
         resp = get_data_client().run_report(req)
     except GoogleAPIError as e:
@@ -175,8 +188,12 @@ def estimate_row_count(
     GA4 returns the total number of rows even when `limit=1` — so a single tiny
     request gives you the full size before committing to fetching everything.
     """
+    executor = None
+    if is_hosted_production():
+        deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+        executor = get_google_account_registry().router.for_ga4(property_id, deadline)
     req = RunReportRequest(
-        property=normalize_property(property_id),
+        property=executor.property_id if executor is not None else normalize_property(property_id),
         date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
         dimensions=_build_dimensions(dimensions),
         metrics=_build_metrics(metrics),
@@ -184,6 +201,8 @@ def estimate_row_count(
         metric_filter=_build_filter(metric_filter),
         limit=1,
     )
+    if executor is not None:
+        return executor.execute(lambda sdk: int(sdk.ga4_data.run_report(req).row_count or 0))
     try:
         resp = get_data_client().run_report(req)
     except GoogleAPIError as e:

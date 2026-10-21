@@ -450,7 +450,19 @@ def test_qualified_synthetic_actual_sdk_transport_path(tmp_path):
     assert result["business_qualified"] is False
     assert result["positive_business_observation"] is False
     assert result["bing_sdk_calls"] == len(peer.calls) == 11
-    assert result["qualified_upstream_attempts_upper_bound"] == 11
+    # One listing, then ten fresh discovery + business pairs. This is a
+    # theoretical zero-retry upper bound, never an observed upstream counter
+    # or permission to exceed the unchanged rolling twelve-attempt admission.
+    assert result["qualified_upstream_attempts_upper_bound"] == 1 + 10 * (1 + 1) == 21
+    listing = [name for name, _ in peer.calls if name == "bing_list_sites"]
+    business = [name for name, _ in peer.calls if name != "bing_list_sites"]
+    theoretical_stages = ["listing"] * len(listing) + [
+        stage for _ in business for stage in ("fresh_discovery", "business")
+    ]
+    assert len(listing) == 1 and len(business) == 10
+    assert theoretical_stages.count("fresh_discovery") == 10
+    assert theoretical_stages.count("business") == 10
+    assert len(theoretical_stages) == result["qualified_upstream_attempts_upper_bound"]
     assert all(r.url.host == "google-seo.mcp.propel.marketing" for r in peer.requests)
     assert (
         result["trusted_operator_preflight"]["hold_record"] == doc["authorization"]["hold_record"]
@@ -562,6 +574,39 @@ def test_business_faults_stop_without_retries(case):
     assert result["status"] == "FAIL"
     assert result["bing_sdk_calls"] == len(peer.calls) == 2
     assert result["business_qualified"] is False
+
+
+@pytest.mark.parametrize("target", ["bing_list_sites", "bing_rank_traffic_stats"])
+@pytest.mark.parametrize("code", ["rate_limited", "transport_error"])
+def test_typed_fault_consumes_name_and_stops_without_replay(target, code):
+    peer = Peer()
+
+    def handle(request):
+        response = peer.handle(request)
+        if request.method != "POST" or not request.content:
+            return response
+        body = json.loads(request.content)
+        if body.get("method") != "tools/call" or body["params"]["name"] != target:
+            return response
+        envelope = response.json()
+        data = json.loads(envelope["result"]["content"][0]["text"])["data"]
+        data.update(status="provider_error", records=[], source_rows=0, returned_rows=0,
+                    error={"code": code, "retryable": True})
+        envelope["result"]["content"][0]["text"] = json.dumps({"data": data})
+        return httpx.Response(200, json=envelope)
+
+    result = asyncio.run(smoke.run(options(), transport=httpx.MockTransport(handle)))
+    expected = ["bing_list_sites"] + ([] if target == "bing_list_sites" else [target])
+    assert [name for name, _ in peer.calls] == expected
+    assert result["bing_sdk_calls"] == len(expected)
+    assert result["status"] == "FAIL" and result["error"] == "provider_not_qualified"
+    assert result["business_qualified"] is False
+    # Early typed STOP exits before completion fields are constructed.
+    assert "read_smoke_complete" not in result
+    assert result["tools"][-1]["outcome"] == "provider_error"
+    assert result["tools"][-1]["result"]["error"]["code"] == code
+    assert all(entry["upstream_attempts"] == "unobservable_from_hosted_protocol"
+               for entry in result["tools"])
 
 
 def test_deep_reflection_typed_rows_sanitized_before_save(tmp_path, monkeypatch, capsys):

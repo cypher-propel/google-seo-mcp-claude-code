@@ -2,11 +2,11 @@
 
 Observed period is the UTC date extent of valid source analytics rows BEFORE
 local filtering/limiting. Source rows includes rejected wire rows reported by
-the client; drops excludes policy/window/limit exclusions. No aggregation occurs.
+the client; drops excludes window/limit exclusions. No aggregation occurs.
 """
 
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 
 from pydantic import ValidationError
@@ -26,7 +26,6 @@ from .models import (
     BingTrafficRecord,
     BingUrlInfoRecord,
     CrawlIssueName,
-    validate_public_url,
 )
 from .wire_models import (
     BingWireModel,
@@ -136,14 +135,14 @@ def normalize_bing_rows(
     validated_wire_rows: Sequence[BingWireModel],
     request: BingToolRequest,
     *,
-    approved_sites: Collection[str] | None = None,
+
     invalid_wire_rows: int = 0,
     invalid_wire_dates: int = 0,
     invalid_wire_metrics: int = 0,
 ) -> BingReadResult:
     """Normalize one validated response; never fetch, sort, aggregate or fan out.
 
-    Client MUST pass configured approved_sites on discovery (missing fails closed).
+
     It MUST report rows rejected during wire validation using invalid_wire_rows.
     Optional date/metric counters are disjoint subsets of that total and affect
     safe diagnostics only. Invalid counters raise static ValueError (caller bug).
@@ -165,18 +164,7 @@ def normalize_bing_rows(
             extracted_at=datetime.now(UTC),
             error=BingProviderFault(code="invalid_request"),
         )
-    if operation == BingOperation.GET_USER_SITES:
-        try:
-            if approved_sites is None or isinstance(approved_sites, str | bytes):
-                raise ValueError
-            approved_sites = frozenset(validate_public_url(site) for site in approved_sites)
-        except (ValueError, TypeError):
-            return BingReadResult(
-                status="invalid_request",
-                operation=operation,
-                extracted_at=datetime.now(UTC),
-                error=BingProviderFault(code="invalid_request"),
-            )
+
     requested = (
         None
         if request.start_date is None
@@ -224,10 +212,7 @@ def normalize_bing_rows(
             dropped += 1
             bad_dates += 1
             continue
-        if operation == BingOperation.GET_USER_SITES and (
-            not record.is_verified or record.url not in approved_sites
-        ):
-            continue
+
         if operation in ANALYTICS_OPERATIONS:
             day = record.date_utc.date()
             dates.append(day)
@@ -241,7 +226,7 @@ def normalize_bing_rows(
             warnings.append("unknown_issue_bits")
         records.append(record)
     observed = BingPeriod(start_date=min(dates), end_date=max(dates)) if dates else None
-    # Discovery has no public limit; do not silently cap approved site discovery.
+    # Discovery has no public limit; false rows remain listed.
     truncated = operation != BingOperation.GET_USER_SITES and len(records) > request.limit
     if truncated:
         records = records[: request.limit]

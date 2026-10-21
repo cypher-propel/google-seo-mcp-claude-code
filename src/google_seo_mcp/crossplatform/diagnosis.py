@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from ..auth import get_webmasters, normalize_property
+from ..auth import get_webmasters, normalize_property, is_hosted_production
+from ..gsc.tools import analytics as _gsc_reads
 from ..ga4.data import run_report
 from ..ga4.dates import period as ga_period
 from ..gsc.analytics import expected_ctr, query_search_analytics
@@ -46,8 +47,9 @@ def landing_page_full_diagnosis(
         gsc_page_url = site_url.rstrip("/") + path
 
     # ── GSC: queries for this exact page ────────────────────
-    gsc_rows = query_search_analytics(
-        get_webmasters(),
+    client = _gsc_reads._read_client(site_url, get_webmasters)
+    gsc_rows = _gsc_reads._run_query(
+        client, query_search_analytics,
         site_url,
         gsc_start,
         gsc_end,
@@ -83,8 +85,8 @@ def landing_page_full_diagnosis(
     cannibalized_queries: list[str] = []
     top_q_strs = {q["query"] for q in top_queries[:5] if q["query"]}
     if top_q_strs:
-        qp_rows = query_search_analytics(
-            get_webmasters(),
+        qp_rows = _gsc_reads._run_query(
+            client, query_search_analytics,
             site_url,
             gsc_start,
             gsc_end,
@@ -120,7 +122,7 @@ def landing_page_full_diagnosis(
         ]
     }
     ga = run_report(
-        pid,
+        property_id if is_hosted_production() else pid,
         start_date=ga_start,
         end_date=ga_end,
         metrics=[

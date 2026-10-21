@@ -239,6 +239,19 @@ def test_corrupt_manifest_fails_closed_and_sanitized(monkeypatch, raw):
     assert "SYNTHETIC" not in str(error.value)
 
 
+@pytest.fixture
+def policy_google_custody():
+    # Reuse the protected, explicit two-slot synthetic documents, not ambient
+    # credentials. Keep this dependency local to the allowed-backend matrix.
+    from tests.test_google_accounts_auth import custody
+
+    fixture = custody.__wrapped__()
+    try:
+        yield next(fixture)
+    finally:
+        fixture.close()
+
+
 class GoogleSinkStub:
     """Record only terminal Google methods; no request/client/network implementation."""
 
@@ -305,8 +318,51 @@ class GoogleSinkStub:
 
 @pytest.mark.parametrize("name", sorted(ORIGINAL_EXPECTED))
 def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
-    hosted, monkeypatch, name
+    hosted, monkeypatch, name, policy_google_custody
 ):
+    import requests
+    from urllib.parse import urlsplit
+
+    from tests.test_google_accounts_auth import (
+        ACCOUNTS, CLIENT, LocalWire, close_resources, deadline,
+    )
+
+    root, docs, _, _, _ = policy_google_custody
+    wire = LocalWire(docs)
+    site_url = "http://169.254.169.254/../../key"
+    for account in ACCOUNTS:
+        wire.sites[account] = [{"siteUrl": site_url, "permissionLevel": "siteOwner"}]
+        wire.pages[account] = [{"accountSummaries": [{
+            "account": "accounts/1", "displayName": "synthetic",
+            "propertySummaries": [{
+                "property": "properties/1", "displayName": "synthetic",
+                "parent": "accounts/1", "propertyType": "PROPERTY_TYPE_ORDINARY",
+            }],
+        }]}]
+    sessions = []
+    session_init = requests.sessions.Session.__init__
+
+    def tracked_session(session, *args, **kwargs):
+        session_init(session, *args, **kwargs)
+        sessions.append(session)
+
+    monkeypatch.setattr(requests.sessions.Session, "__init__", tracked_session)
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter, "send",
+        lambda adapter, request, **kwargs: wire.send(request, **kwargs),
+    )
+    config = ProductionRuntimeConfig(
+        profile="production", transport="streamable-http",
+        public_base_url="https://synthetic.invalid",
+        consumer_keys_file=str(root / "unused-consumers.json"),
+        google_auth_mode="dual-user-oauth",
+        google_oauth_client_file=str(root / "client.json"),
+        google_oauth_propel_dms_file=str(root / "a.json"),
+        google_oauth_addourteam99_file=str(root / "b.json"),
+        google_approved_client_id=CLIENT, google_approved_project_id="synthetic-seq208",
+    )
+    auth.configure_hosted_auth(config)
+    registry = auth.get_google_account_registry()
     async def exercise():
         fn = next(fn for fn, tool_name in server._LEGACY_TOOL_DEFINITIONS if tool_name == name)
         # Metadata/private-looking URLs are API filter values, never local fetches.
@@ -334,7 +390,8 @@ def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
             "cross_seo_to_revenue_attribution",
             "cross_landing_page_full_diagnosis",
         }
-        google, vendor_calls = GoogleSinkStub(nonempty=nested), []
+        # Evidence is populated only by actual SDK PreparedRequest sends below.
+        google, vendor_calls = SimpleNamespace(calls=[]), []
 
         def vendor(endpoint, payload, timeout=60):
             vendor_calls.append((endpoint, payload))
@@ -343,36 +400,70 @@ def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
                 "tasks": [{"status_code": 20000, "result": [{"items": []}]}],
             }
 
-        from google_seo_mcp.ga4 import data, schema
+        session_send = requests.sessions.Session.send
+
+        def google_session_send(session, request, **kwargs):
+            # Requests consumes allow_redirects before calling HTTPAdapter.send.
+            # Observe the real account-bound session entry, then retain its
+            # actual send path through the final synthetic adapter below.
+            assert kwargs["allow_redirects"] is False
+            assert kwargs["proxies"] == {}
+            assert session.trust_env is False
+            return session_send(session, request, **kwargs)
+
+        def google_send(adapter, request, **kwargs):
+            target = urlsplit(request.url)
+            assert target.scheme == "https"
+            assert target.netloc in {
+                "oauth2.googleapis.com", "www.googleapis.com", "searchconsole.googleapis.com",
+                "analyticsadmin.googleapis.com", "analyticsdata.googleapis.com",
+            }
+            assert kwargs["proxies"] == {}
+            response = wire.send(request, **kwargs)
+            path = target.path
+            body = json.loads(request.body or "{}") if request.method == "POST" else {}
+            payload = None
+            if path.endswith("/searchAnalytics/query"):
+                method = "execute"
+                payload = {"rows": []}
+                if nested:
+                    payload["rows"] = [{
+                        "keys": [
+                            "offline query" if dimension == "query" else values["site_url"]
+                            for dimension in body.get("dimensions", [])
+                        ],
+                        "clicks": 40, "impressions": 1000, "position": 7, "ctr": 0.04,
+                    }]
+            elif path.endswith(":runReport"):
+                method, payload = "run_report", {"rowCount": 0}
+            elif path.endswith("/metadata"):
+                method, payload = "get_metadata", {"dimensions": [], "metrics": []}
+            elif path.endswith("/accountSummaries"):
+                method = "list_account_summaries"
+            elif target.netloc == "analyticsadmin.googleapis.com":
+                method, payload = "get_property", {
+                    "name": "properties/1", "displayName": "stub", "timeZone": "UTC",
+                    "currencyCode": "USD", "account": "accounts/1",
+                }
+            else:
+                method = "execute"
+                if not path.endswith("/sites"):
+                    payload = {}
+            google.calls.append([(method, {"url": request.url, "body": body})])
+            if payload is not None:
+                response._content = json.dumps(payload).encode()
+            return response
+
+        from google_seo_mcp.ga4 import schema
 
         monkeypatch.setattr(schema, "_schema_by_property", {})
-        modules = [
-            server.gsc_sites,
-            server.gsc_sitemaps,
-            server.gsc_analytics,
-            server.gsc_intel,
-            server.ga4_admin,
-            server.cp_attr,
-            server.cp_diag,
-            server.cp_health,
-            server.cp_journey,
-            server.cp_matrix,
-            data,
-            schema,
-        ]
+        monkeypatch.setattr(schema, "_schema_by_partition", {})
         sink = Mock(
             side_effect=AssertionError("allowed backend attempted arbitrary file or network")
         )
         with ExitStack() as stack:
-            for module in modules:
-                for getter in (
-                    "get_webmasters",
-                    "get_searchconsole",
-                    "get_data_client",
-                    "get_admin_client",
-                ):
-                    if hasattr(module, getter):
-                        stack.enter_context(patch.object(module, getter, return_value=google))
+            stack.enter_context(patch.object(requests.sessions.Session, "send", google_session_send))
+            stack.enter_context(patch.object(requests.adapters.HTTPAdapter, "send", google_send))
             stack.enter_context(
                 patch.object(server.serp_tools, "call_dataforseo", side_effect=vendor)
             )
@@ -390,7 +481,29 @@ def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
         if nested:
             assert any(method == "run_report" for chain in google.calls for method, _ in chain)
 
-    asyncio.run(exercise())
+    primary = None
+    try:
+        # Admit real synthetic custody and bundled SDK documents before traps;
+        # fresh generation and membership checks remain active during dispatch.
+        assert tuple(c.account_id for c in registry.loader.load_accounts()) == ACCOUNTS
+        for account in ACCOUNTS:
+            assert registry.clients.execute(account, lambda sdk: sdk.account_id, deadline()) == account
+        for provider in ("gsc", "ga4"):
+            snapshot = registry.discovery.discover(provider, deadline())
+            assert snapshot.complete
+            assert snapshot.per_account_status == {account: "available" for account in ACCOUNTS}
+            assert len(snapshot.memberships) == 1
+            assert set(snapshot.memberships[0].account_ids) == set(ACCOUNTS)
+        wire.calls.clear()
+        asyncio.run(exercise())
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            registry.retire()
+        finally:
+            close_resources([*sessions, *wire.responses], primary)
 
 
 def test_worker_bound_retains_validated_consumer_context(hosted):

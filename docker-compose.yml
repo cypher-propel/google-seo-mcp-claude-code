@@ -3,6 +3,8 @@ name: google-seo-mcp
 services:
   google-seo-mcp:
     # Supply a reviewed release as registry/repository@sha256:<digest>.
+    # Source template only: the historical wheel/image recipe is NOT qualified
+    # for dual OAuth. New packaging/image and operator cutover gates remain.
     image: "${GOOGLE_SEO_IMAGE:?Set the qualified immutable image reference}"
     platform: linux/amd64
     command: ["--transport", "streamable-http"]
@@ -24,7 +26,7 @@ services:
     environment:
       GOOGLE_SEO_TRANSPORT: streamable-http
       GOOGLE_SEO_PROFILE: production
-      GOOGLE_SEO_AUTH_MODE: service-account
+      GOOGLE_SEO_AUTH_MODE: dual-user-oauth
       GOOGLE_SEO_HOST: 0.0.0.0
       GOOGLE_SEO_PORT: "8000"
       GOOGLE_SEO_PUBLIC_BASE_URL: "${GOOGLE_SEO_PUBLIC_BASE_URL:-https://google-seo.mcp.propel.marketing}"
@@ -33,12 +35,17 @@ services:
       GOOGLE_SEO_ACCEPTED_HOSTS: "${GOOGLE_SEO_ACCEPTED_HOSTS:-google-seo.mcp.propel.marketing,localhost:8000,127.0.0.1:8000,[::1]:8000,localhost:3006,127.0.0.1:3006,[::1]:3006}"
       GOOGLE_SEO_ACCEPTED_ORIGINS: "${GOOGLE_SEO_ACCEPTED_ORIGINS:-https://google-seo.mcp.propel.marketing}"
       GOOGLE_SEO_CONSUMER_KEYS_FILE: /run/secrets/consumer-keys.json
-      GOOGLE_SEO_SERVICE_ACCOUNT_FILE: /run/secrets/google-seo-service-account.json
+      GOOGLE_SEO_OAUTH_CLIENT_FILE: /run/secrets/google-seo-oauth-client.json
+      GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE: /run/secrets/google-seo-oauth-propel-dms.json
+      GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE: /run/secrets/google-seo-oauth-addourteam99.json
+      # Nonsecret operator-approved bindings; no invented defaults or enrollment.
+      GOOGLE_SEO_APPROVED_CLIENT_ID: "${GOOGLE_SEO_APPROVED_CLIENT_ID:?Set the operator-approved OAuth client ID}"
+      GOOGLE_SEO_APPROVED_PROJECT_ID: "${GOOGLE_SEO_APPROVED_PROJECT_ID:?Set the operator-approved OAuth project ID}"
       GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS: "${GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS:-false}"
       # Paths only; reuse /run/secrets. Absent Bing files are intentional until
       # the runbook HOLD/resume gate; never inject a literal API key here.
       GOOGLE_SEO_BING_CREDENTIALS_FILE: /run/secrets/bing-webmaster.json
-      GOOGLE_SEO_BING_SITES_FILE: /run/secrets/bing-sites.json
+
       GOOGLE_SEO_REQUIRE_BING_CREDENTIALS: "${GOOGLE_SEO_REQUIRE_BING_CREDENTIALS:-false}"
       GSC_ALLOW_DESTRUCTIVE: "false"
       GOOGLE_SEO_ALLOW_INDEXNOW: "false"
@@ -48,7 +55,7 @@ services:
       DATAFORSEO_LOGIN: "${DATAFORSEO_LOGIN:-}"
       DATAFORSEO_PASSWORD: "${DATAFORSEO_PASSWORD:-}"
     volumes:
-      # One protected directory; SA file may intentionally be absent. Directory
+      # One protected directory; OAuth slots may intentionally be absent. Directory
       # must exist and contain the required hash-only consumer-keys.json file.
       - type: bind
         source: "${GOOGLE_SEO_SECRETS_DIR:?Set the protected secrets directory}"

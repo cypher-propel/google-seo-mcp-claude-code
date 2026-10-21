@@ -9,8 +9,11 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from ..auth import is_hosted_production
+from ..google_accounts.models import GoogleAccountError
 from ..gsc.analytics import query_search_analytics
 from ..gsc.dates import period as gsc_period
+from ..gsc.tools.analytics import _read_client, _run_query
 from .wp_audit import (
     crawl_site_advertools,
     fetch_wp_redirects,
@@ -74,12 +77,13 @@ def build_equity_report(
     # 5. GSC data per URL (if site_url passed)
     gsc_by_url: dict[str, dict] = {}
     if gsc_site_url:
+        gsc_failure = None
         try:
             from ..auth import get_webmasters
-            wm = get_webmasters()
+            wm = _read_client(gsc_site_url, get_webmasters)
             start, end = gsc_period(days)
-            rows = query_search_analytics(
-                wm, gsc_site_url, start, end,
+            rows = _run_query(
+                wm, query_search_analytics, gsc_site_url, start, end,
                 dimensions=["page"], row_limit=25000, fetch_all=True,
             )
             for r in rows:
@@ -91,8 +95,20 @@ def build_equity_report(
                         "ctr": r.get("ctr", 0),
                         "position": r.get("position", 0),
                     }
+        except GoogleAccountError as e:
+            if is_hosted_production():
+                gsc_failure = GoogleAccountError(e.code)
+            else:
+                inventory["gsc_error"] = str(e)[:200]
         except Exception as e:
-            inventory["gsc_error"] = str(e)[:200]
+            if is_hosted_production():
+                gsc_failure = GoogleAccountError("agency_discovery_incomplete")
+            else:
+                inventory["gsc_error"] = str(e)[:200]
+        # Raise outside the catch so raw provider context cannot escape, and never
+        # return an apparently complete report from an incomplete hosted union.
+        if gsc_failure is not None:
+            raise gsc_failure from None
 
     # 6. Score each URL
     # Components: clicks (50%), impressions (15%), in_degree (20%), schema (10%), text length (5%)

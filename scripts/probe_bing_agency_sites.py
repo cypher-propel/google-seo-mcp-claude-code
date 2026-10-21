@@ -53,7 +53,7 @@ from google_seo_mcp.bing.client import (
     BingReadClient, _CAP, _Stop, _decoded, _quiet, _reject_reflection, _unique,
 )
 from google_seo_mcp.bing.models import (
-    BingModel, BingOperation, BingProviderFault, BingReadResult, BingToolRequest,
+    BingModel, BingOperation, BingProviderFault, BingRawResponse, BingReadResult, BingToolRequest,
     SafeCode, validate_public_url,
 )
 from google_seo_mcp.bing.wire_models import RawBingSite
@@ -256,17 +256,32 @@ class RawInventoryProbe(BingReadClient):
                 return _fault("invalid_request")
             if self._loader is None:
                 self._loader = BingCredentialLoader()
-            self._authorize(request)
+            key = self._authorize(request)
             if not budget.remaining():
                 return _fault("timeout")
-            # Deliberately no retry loop, normalization, selectors or business call.
-            status, _retry_after, body, key = self._attempt(request, budget)
-            _operator_reflection(body.decode("utf-8", errors="strict"), key)
-            if status != 200:
+            generation = self._loader.generation()
+            if not budget.remaining():
+                return _fault("timeout")
+            # One current typed primitive, not recursive discovery or business.
+            # Key custody remains local; no key is returned by the raw producer.
+            raw = self._attempt(request, budget, expected_generation=generation)
+            if type(raw) is not BingRawResponse:
+                return _fault("invalid_response")
+            # Private/excluded fields are not an egress-safety certificate. Do
+            # not model_dump(): that deliberately hides every transfer field.
+            try:
+                raw = BingRawResponse.model_validate(dict(vars(raw)))
+            except Exception:
+                return _fault("invalid_response")
+            _operator_reflection([raw.retry_after, raw.credential_generation], key)
+            if raw.credential_generation != generation:
+                return _fault("credentials_invalid")
+            _operator_reflection(raw.body.decode("utf-8", errors="strict"), key)
+            if raw.status_code != 200:
                 return _fault({401: "access_denied", 403: "access_denied",
-                               429: "rate_limited", -1: "transport_error"}.get(
-                                   status, "provider_error"))
-            result = parse_inventory(body, key)
+                               429: "rate_limited"}.get(raw.status_code, "provider_error"))
+            result = parse_inventory(raw.body, key)
+            self._loader.require_generation(generation)
             if not budget.remaining():
                 return _fault("timeout")
             return result
@@ -274,8 +289,10 @@ class RawInventoryProbe(BingReadClient):
             return _fault({"credentials_missing": "provider_not_configured",
                            "credentials_invalid": "credentials_invalid",
                            "site_denied": "site_denied"}.get(exc.code, "credentials_invalid"))
-        except _Stop as exc:
-            return _fault(exc.code)
+        except _Stop:
+            # The actual typed worker owns cancellation. Returning a dict here
+            # would turn an explicit typed fault into timeout on its unwind.
+            raise
         except UnicodeError:
             return _fault("invalid_response")
         except Exception:
@@ -340,8 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 with _quiet():
                     try:
                         configure_bing_auth(SimpleNamespace(
-                            bing_credentials_file="/run/secrets/bing-webmaster.json",
-                            bing_sites_file="/run/secrets/bing-sites.json"))
+                            bing_credentials_file="/run/secrets/bing-webmaster.json"))
                         custody = _EgressCustody(BingCredentialLoader())
                         result = run_probe(RawInventoryProbe(custody, max_retries=0))
                     except Exception:

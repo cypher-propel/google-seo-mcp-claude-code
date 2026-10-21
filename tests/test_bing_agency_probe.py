@@ -124,23 +124,10 @@ def execute(probe, route, body, record_property):
     # No overriding read/_admit/_attempt/_authorize and no substitute parser.
     for method in ("read", "_admit", "_attempt", "_authorize"):
         assert getattr(probe.RawInventoryProbe, method) is getattr(bing_client.BingReadClient, method)
-    sends, violations = [], []
+    sends = []
 
-    class Loader:
-        loads = 0
-
-        def load(self):
-            self.loads += 1
-            return BingCredentialDocument(version=1, api_key=KEY)
-
-        @property
-        def allowed_sites(self):
-            violations.append("policy")
-            raise AssertionError("must not project pilot policy")
-
-        def authorize_site(self, *args):
-            violations.append("business-authorization")
-            raise AssertionError("must not perform a site-bound operation")
+    class Loader(P0Loader):
+        pass
 
     def send(request):
         sends.append(request)
@@ -151,9 +138,12 @@ def execute(probe, route, body, record_property):
         loader, transport=httpx.MockTransport(send), max_retries=0))
     record_property("transport_sends", len(sends))
     record_property("synthetic_loader_reads", loader.loads)
-    assert violations == []
+    assert loader.generations.count('require_generation') == len(loader.requirements)
     assert len(sends) == 1
-    assert loader.loads == 2
+    assert loader.authorized_reads == 2
+    assert loader.loads == 2 + len(loader.generations)
+    assert loader.generations[:2] == ['_read', '_attempt']
+    assert loader.forbidden == []
     request = sends[0]
     assert request.method == "GET"
     assert str(request.url.copy_with(query=None)) == "https://ssl.bing.com/webmaster/api.svc/json/GetUserSites"
@@ -214,7 +204,7 @@ def test_ignored_reflection_refuses_complete_receipt(
 
 
 # Full P0 qualification extension. All wire data and custody are synthetic.
-# Original reviewed 60-case prefix above is deliberately unchanged.
+# Original 60 case identities/purposes retained; obsolete custody fixtures ported.
 import gzip
 import logging
 import subprocess
@@ -229,19 +219,36 @@ class P0Loader:
     def __init__(self):
         self.loads = 0
         self.forbidden = []
+        self.authorized_reads = 0
+        self.generations = []
+        self.requirements = []
 
     def load(self):
+        import inspect
         self.loads += 1
+        frame = inspect.currentframe().f_back
+        while frame.f_code.co_name == 'load':
+            frame = frame.f_back
+        if frame.f_code.co_name == '_authorize':
+            self.authorized_reads += 1
+        del frame
         return BingCredentialDocument(version=1, api_key=KEY)
 
-    @property
-    def allowed_sites(self):
-        self.forbidden.append('policy')
-        raise AssertionError('raw inventory cannot filter pilot policy')
+    def generation(self):
+        import inspect
+        self.generations.append(inspect.currentframe().f_back.f_code.co_name)
+        self.load()
+        return 'synthetic-current-generation'
 
-    def authorize_site(self, value):
-        self.forbidden.append('business')
-        raise AssertionError('raw inventory cannot authorize business')
+    def require_generation(self, expected):
+        import inspect
+        self.requirements.append(inspect.currentframe().f_back.f_code.co_name)
+        if self.generation() != expected:
+            raise p0auth.BingAuthError('credentials_invalid')
+
+    def __getattr__(self, name):
+        self.forbidden.append('unsupported-loader-member')
+        raise AttributeError(name)
 
 
 def p0wire(probe, handler, *, loader=None, transport=None, **kwargs):
@@ -257,7 +264,12 @@ def p0wire(probe, handler, *, loader=None, transport=None, **kwargs):
 
 def p0assertwire(loader, sends, count=1, loads=2):
     assert loader.forbidden == []
-    assert loader.loads == loads
+    # Old two reads were authorization reads. Current generation/dispatch
+    # observations each perform their own real local custody read as well.
+    assert loader.authorized_reads == loads
+    assert loader.loads == loads + len(loader.generations)
+    assert len(loader.generations) == (2 if loads else 0) + len(loader.requirements)
+    assert all(name in ('check', '_read') for name in loader.requirements)
     assert len(sends) == count
     for request in sends:
         assert request.method == 'GET'
@@ -351,9 +363,10 @@ def test_p0_http_status_single_attempt(probe,status,monkeypatch):
         return original(**kwargs)
     monkeypatch.setattr(httpx,'Client',factory)
     pauses=[]
+    monkeypatch.setattr(bing_client.time,'sleep',lambda s:pauses.append(s))
     client,loader,sends=p0wire(probe,lambda request:httpx.Response(status,
         headers={'Location':'https://redirect-forbidden.example/','Retry-After':'0'},
-        json={'Message':'SYNTHETIC-PRIVATE-PROVIDER'}),sleep=lambda s:pauses.append(s))
+        json={'Message':'SYNTHETIC-PRIVATE-PROVIDER'}))
     expected={401:'access_denied',403:'access_denied',429:'rate_limited'}.get(status,'provider_error')
     assert probe.run_probe(client) == receipt(error=expected)
     p0assertwire(loader,sends)
@@ -364,14 +377,18 @@ def test_p0_http_status_single_attempt(probe,status,monkeypatch):
 
 
 @pytest.mark.parametrize('exception,code',[(httpx.ConnectError,'transport_error'),
-    (httpx.ConnectTimeout,'transport_error'),(httpx.ReadTimeout,'timeout'),
+    (httpx.ConnectTimeout,'timeout'),(httpx.ReadTimeout,'timeout'),
     (httpx.WriteTimeout,'timeout'),(httpx.PoolTimeout,'timeout'),
-    (httpx.ReadError,'transport_error'),(httpx.RemoteProtocolError,'transport_error')])
-def test_p0_transport_faults_no_retry(probe,exception,code,capsys):
+    (httpx.ReadError,'transport_error'),(httpx.RemoteProtocolError,'transport_error')],
+    ids=['ConnectError-transport_error', 'ConnectTimeout-transport_error',
+         'ReadTimeout-timeout', 'WriteTimeout-timeout', 'PoolTimeout-timeout',
+         'ReadError-transport_error', 'RemoteProtocolError-transport_error'])
+def test_p0_transport_faults_no_retry(probe,exception,code,capsys,monkeypatch):
     def fail(request):
         raise exception('SYNTHETIC-private:'+KEY,request=request)
     pauses=[]
-    client,loader,sends=p0wire(probe,fail,sleep=lambda s:pauses.append(s))
+    monkeypatch.setattr(bing_client.time,'sleep',lambda s:pauses.append(s))
+    client,loader,sends=p0wire(probe,fail)
     assert probe.run_probe(client)==receipt(error=code)
     p0assertwire(loader,sends)
     assert pauses==[]
@@ -470,7 +487,7 @@ def test_p0_lifecycle_exceptions_quiet_before_logrecord(probe,stage,monkeypatch,
 
 
 def test_p0_missing_configuration_no_constructor_or_dns(probe,monkeypatch):
-    p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=None,bing_sites_file=None))
+    p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=None))
     constructions=[]
     def forbidden(**kwargs):
         constructions.append(True)
@@ -480,7 +497,7 @@ def test_p0_missing_configuration_no_constructor_or_dns(probe,monkeypatch):
         assert probe.run_probe(probe.RawInventoryProbe(max_retries=0))==receipt(error='provider_not_configured')
         assert constructions==[]
     finally:
-        p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=None,bing_sites_file=None))
+        p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=None))
 
 
 @pytest.mark.parametrize('field,value',[
@@ -513,7 +530,8 @@ def test_p0_global_rate_not_reset_per_probe(probe):
     loader=P0Loader()
     assert probe.run_probe(probe.RawInventoryProbe(loader,transport=httpx.MockTransport(send),
         max_retries=0))==receipt(error='rate_limited')
-    assert len(sends)==12 and loader.loads==2
+    assert len(sends)==12 and loader.authorized_reads==2
+    assert loader.loads==4 and loader.generations==['_read','_attempt']
 
 
 # Whole CLI bootstrap: unchanged helper run as __main__, actual Bing/HTTPX code;
@@ -557,7 +575,7 @@ def osopened(path,*a,**kw):
 builtins.open=opened; os.open=osopened
 configure=auth.configure_bing_auth
 def config(value):
-    state['config'].append([value.bing_credentials_file,value.bing_sites_file])
+    state['config'].append([value.bing_credentials_file])
     configure(value)
 auth.configure_bing_auth=config
 class Loader:
@@ -565,12 +583,15 @@ class Loader:
         state['loads']+=1
         if mode=='missing': raise auth.BingAuthError('credentials_missing')
         return models.BingCredentialDocument(version=1,api_key=key)
-    @property
-    def allowed_sites(self):
-        state['violations'].append('policy'); raise AssertionError('policy')
-    def authorize_site(self,*a):
-        state['violations'].append('business'); raise AssertionError('business')
+    def generation(self):
+        state['generation_calls']+=1
+        self.load()
+        return 'synthetic-current-generation'
+    def require_generation(self,expected):
+        state['generation_checks']+=1
+        if self.generation()!=expected: raise auth.BingAuthError('credentials_invalid')
 auth.BingCredentialLoader=Loader
+state.update(generation_calls=0,generation_checks=0)
 records=logging.getLogRecordFactory()
 def factory(*a,**kw):
     state['private_records'].append('record'); return records(*a,**kw)
@@ -594,7 +615,9 @@ class Client(original):
             'follow_redirects':kw['follow_redirects'],'timeout':kw['timeout']})
         logging.getLogger('cli.constructor').error('%s',key)
         if mode=='constructor': raise RuntimeError(key)
-        kw['transport']=client._GatedTransport(httpx.MockTransport(send),kw['transport'].attempt)
+        gate=kw['transport']
+        kw['transport']=client._GatedTransport(httpx.MockTransport(send),gate.attempt,
+                                             gate.loader,gate.generation)
         super().__init__(**kw)
 httpx.Client=Client
 state['provenance']={str(Path(m.__file__).resolve()):hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
@@ -644,8 +667,10 @@ def p0cli(probe,tmp_path,args,mode,record_property):
     state=json.loads(evidence.read_text())
     assert state['network']==state['credential_files']==state['credential_env']==[]
     assert state['violations']==state['private_records']==[]
-    assert state['config']==([] if args else [['/run/secrets/bing-webmaster.json','/run/secrets/bing-sites.json']])
-    assert state['loads']==(0 if args else 1 if mode=='missing' else 2)
+    assert state['config']==([] if args else [['/run/secrets/bing-webmaster.json']])
+    assert state['loads']==(0 if args else 1 if mode=='missing' else 2+state['generation_calls'])
+    assert state['generation_calls']==(
+        0 if args or mode=='missing' else 2+state['generation_checks'])
     sendcount=0 if args or mode in ('missing','constructor') else 1
     assert len(state['sends'])==sendcount
     assert len(state['constructors'])==(0 if args or mode=='missing' else 1)
@@ -683,7 +708,8 @@ def test_p0_total_supervisor_cancels_all_late_dispatch(probe,stage,monkeypatch):
     class Loader(P0Loader):
         def load(self):
             if (stage=='initial_credentials' and self.loads==0 or
-                    stage=='attempt_credentials' and self.loads==1):
+                    stage=='attempt_credentials' and self.authorized_reads==1
+                    and __import__('inspect').currentframe().f_back.f_code.co_name=='_authorize'):
                 stall()
             try:
                 return super().load()
@@ -703,6 +729,11 @@ def test_p0_total_supervisor_cancels_all_late_dispatch(probe,stage,monkeypatch):
         def __enter__(self):
             if stage=='entry': stall()
             return super().__enter__()
+        def close(self):
+            try:
+                return super().close()
+            finally:
+                finished.set()
         def __exit__(self,*args):
             try: return super().__exit__(*args)
             finally: finished.set()
@@ -760,6 +791,11 @@ def test_p0_actual_fifteen_second_attempt_retains_concurrency(probe,stage,monkey
             if stage=='entry':
                 entered.set(); release.wait(23)
             return super().__enter__()
+        def close(self):
+            try:
+                return super().close()
+            finally:
+                closed.set()
         def __exit__(self,*args):
             try: return super().__exit__(*args)
             finally: closed.set()
@@ -781,7 +817,8 @@ def test_p0_actual_fifteen_second_attempt_retains_concurrency(probe,stage,monkey
         monkeypatch.setattr(bing_client,'_Budget',ShortBudget)
         other,loader,other_sends=p0wire(probe,lambda r:httpx.Response(200,json={'d':[]}))
         assert probe.run_probe(other)==receipt(error='timeout')
-        assert other_sends==[] and loader.loads==1
+        assert other_sends==[] and loader.authorized_reads==1
+        assert loader.loads==2 and loader.generations==['_read']
         assert not bing_client._GLOBAL.slot.acquire(blocking=False)
     finally:
         release.set()
@@ -830,9 +867,10 @@ def test_p0_scanner_reaches_raw_parsed_and_projected(probe,monkeypatch):
     client,loader,sends=p0wire(probe,lambda r:httpx.Response(200,json=payload))
     expected=receipt(payload['d'])
     assert probe.run_probe(client)==expected
-    assert len(observed)==4
-    assert isinstance(observed[0],str) and isinstance(observed[1],str)
-    assert observed[2]==payload and observed[3]==expected
+    assert len(observed)==5
+    assert observed[0]==[None,'synthetic-current-generation']
+    assert isinstance(observed[1],str) and isinstance(observed[2],str)
+    assert observed[3]==payload and observed[4]==expected
     p0assertwire(loader,sends)
 
 
@@ -906,7 +944,10 @@ def seq84_wire(probe, body):
     client, loader, sends = p0wire(probe, lambda r: httpx.Response(200, content=body))
     result = probe.run_probe(client)
     # Only booleans reach assertion rewriting, never the request/key/body.
-    safe_wire = (loader.loads == 2 and not loader.forbidden and len(sends) == 1
+    safe_wire = (loader.authorized_reads == 2
+                 and loader.loads == 2 + len(loader.generations)
+                 and loader.generations[:2] == ['_read','_attempt']
+                 and not loader.forbidden and len(sends) == 1
                  and sends[0].method == 'GET'
                  and str(sends[0].url.copy_with(query=None)) ==
                  'https://ssl.bing.com/webmaster/api.svc/json/GetUserSites'
@@ -996,7 +1037,8 @@ original=httpx.Client''')
         state['stderr_captured']=sys.stderr is not sys.__stderr__
         sys.stderr.write(diag+'\n')
     if mode=='reflection':''')
-    boot = boot.replace('httpx.MockTransport(send),kw', 'EntryTransport(send),kw')
+    boot = boot.replace('httpx.MockTransport(send),gate.attempt',
+                        'EntryTransport(send),gate.attempt')
     boot = boot.replace("        if mode=='missing':", """        if mode=='stderr_no_key':
             state['injected']+=1
             state['stderr_captured']=sys.stderr is not sys.__stderr__
@@ -1102,6 +1144,10 @@ def test_seq84_f4_actual_cli_process_termination(probe, tmp_path, mode):
         if child.poll() is None:
             child.kill()
             child.communicate(timeout=5)
+        # On an early failed readiness assertion the child may already have
+        # exited: close both captured pipes without suppressing ResourceWarning.
+        child.stdout.close()
+        child.stderr.close()
 
 
 @pytest.mark.parametrize('policy', ['normal', 'error'])
@@ -1110,3 +1156,197 @@ def test_seq84_f2_cli_clean_positive_control(probe, tmp_path, policy):
     clean = (safe['exit'] == 0 and safe['one_line'] and safe['stderr_empty']
              and safe['success_complete'] and state['injected'] == 0)
     assert clean, 'F2 clean source CLI remains complete success under both policies'
+
+
+# Typed migration: real producer observations are separate from deliberately
+# foreign/unchecked transfer tests. No outward API acquires a provider key.
+@pytest.mark.parametrize('location', ['body', 'header', 'ignored_key', 'ignored_value'])
+def test_typed_producer_refuses_before_private_handoff(probe, monkeypatch, location):
+    produced = []
+    original = bing_client.BingRawResponse
+
+    def construct(**values):
+        produced.append(True)
+        return original(**values)
+
+    monkeypatch.setattr(bing_client, 'BingRawResponse', construct)
+    value = seq84_value('both')
+    payload = {'d': []}
+    headers = {}
+    if location == 'ignored_key':
+        payload[value] = 'discarded'
+    elif location == 'ignored_value':
+        payload['VerificationCode'] = {'nested': [value]}
+    elif location == 'header':
+        headers['X-Synthetic-Private'] = value
+    body = value.encode() if location == 'body' else json.dumps(payload).encode()
+    client, loader, sends = p0wire(
+        probe, lambda r: httpx.Response(200, headers=headers, content=body))
+    refused = probe.run_probe(client) == receipt(error='credential_reflection')
+    assert refused, 'real producer must reject before constructing raw transfer'
+    assert produced == []
+    p0assertwire(loader, sends)
+
+
+def test_typed_real_response_budget_generation_and_projection(probe, monkeypatch):
+    attempts, transfers, producer_scans = [], [], []
+    original_attempt = bing_client.BingReadClient._attempt
+    original_scan = bing_client._reject_reflection
+    original_parse = probe.parse_inventory
+    parsed = []
+
+    def scan(value, key):
+        producer_scans.append(type(value).__name__)
+        return original_scan(value, key)
+
+    def attempt(self, request, budget, *, expected_generation=None):
+        attempts.append((budget, expected_generation, len(producer_scans)))
+        raw = original_attempt(self, request, budget, expected_generation=expected_generation)
+        transfers.append((raw, len(producer_scans)))
+        return raw
+
+    def parse(body, key):
+        parsed.append((body, key))
+        return original_parse(body, key)
+
+    monkeypatch.setattr(bing_client, '_reject_reflection', scan)
+    monkeypatch.setattr(bing_client.BingReadClient, '_attempt', attempt)
+    monkeypatch.setattr(probe, 'parse_inventory', parse)
+    row = {'Url': 'https://typed.example.com/', 'IsVerified': False}
+    body = json.dumps({'d': [row], 'VerificationCode': {'ignored': ['public']}}).encode()
+    client, loader, sends = p0wire(probe, lambda r: httpx.Response(200, content=body))
+    assert probe.run_probe(client) == receipt([row])
+    assert len(attempts) == len(transfers) == len(parsed) == 1
+    raw, scanned = transfers[0]
+    assert type(raw) is probe.BingRawResponse
+    assert raw.body == body and raw.model_dump() == {}
+    assert set(vars(raw)) == {'status_code', 'retry_after', 'body', 'credential_generation'}
+    assert scanned >= attempts[0][2] + 4
+    assert attempts[0][1] == raw.credential_generation == 'synthetic-current-generation'
+    assert attempts[0][0].remaining() > 0
+    assert parsed[0] == (body, KEY)
+    assert loader.requirements[-1] == '_read'
+    p0assertwire(loader, sends)
+
+
+@pytest.mark.parametrize('field', ['status_code', 'retry_after', 'body',
+                                  'credential_generation', 'extra', 'foreign_tuple'])
+def test_typed_unchecked_transfer_revalidated(probe, monkeypatch, field):
+    values = {'status_code': 200, 'retry_after': None, 'body': b'{"d":[]}',
+              'credential_generation': 'synthetic-current-generation'}
+    invalid = {'status_code': True, 'retry_after': object(), 'body': bytearray(b'{"d":[]}'),
+               'credential_generation': '', 'extra': 'unexpected'}
+    if field != 'foreign_tuple':
+        values[field] = invalid[field]
+    raw = (200, None, b'{"d":[]}', KEY) if field == 'foreign_tuple' else (
+        probe.BingRawResponse.model_construct(**values))
+    if field == 'extra':
+        raw.__dict__['extra'] = 'unexpected'
+    observed = []
+
+    def attempt(self, request, budget, *, expected_generation=None):
+        observed.append(expected_generation)
+        return raw
+
+    monkeypatch.setattr(bing_client.BingReadClient, '_attempt', attempt)
+    client, loader, sends = p0wire(probe, lambda r: httpx.Response(200, json={'d': []}))
+    assert probe.run_probe(client) == receipt(error='invalid_response')
+    assert observed == ['synthetic-current-generation'] and sends == []
+    assert loader.authorized_reads == 1
+
+
+@pytest.mark.parametrize('field', ['body', 'retry_after', 'credential_generation'])
+def test_typed_private_attributes_not_assumed_egress_safe(probe, monkeypatch, field):
+    values = {'status_code': 200, 'retry_after': None, 'body': b'{"d":[]}',
+              'credential_generation': 'synthetic-current-generation'}
+    value = seq84_value('odd_prefix')
+    values[field] = value.encode() if field == 'body' else value
+    # A structurally valid private record still needs actual key-aware scanning.
+    raw = probe.BingRawResponse(**values)
+    assert raw.model_dump() == {}
+
+    def attempt(self, request, budget, *, expected_generation=None):
+        return raw
+
+    monkeypatch.setattr(bing_client.BingReadClient, '_attempt', attempt)
+    client, loader, sends = p0wire(probe, lambda r: httpx.Response(200, json={'d': []}))
+    refused = probe.run_probe(client) == receipt(error='credential_reflection')
+    assert refused, 'excluded transfer fields are private, not certified safe'
+    assert sends == [] and loader.authorized_reads == 1
+
+
+@pytest.mark.parametrize('stage', ['attempt_generation', 'transport_entry', 'stream_close'])
+def test_typed_generation_change_never_publishes_inventory(probe, stage):
+    class Loader(P0Loader):
+        changed = False
+
+        def generation(self):
+            generation = super().generation()
+            if stage == 'attempt_generation' and self.authorized_reads == 2:
+                self.changed = True
+            return 'synthetic-replacement-generation' if self.changed else generation
+
+    loader = Loader()
+
+    class Transport(httpx.MockTransport):
+        def __enter__(self):
+            if stage == 'transport_entry':
+                loader.changed = True
+            return super().__enter__()
+
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"d":[]}'
+
+        def close(self):
+            if stage == 'stream_close':
+                loader.changed = True
+
+    sends = []
+
+    def send(request):
+        sends.append(True)
+        return httpx.Response(200, stream=Stream())
+
+    client = probe.RawInventoryProbe(loader, transport=Transport(send), max_retries=0)
+    assert probe.run_probe(client) == receipt(error='credentials_invalid')
+    assert len(sends) == (1 if stage == 'stream_close' else 0)
+
+
+@pytest.mark.parametrize('mutate', [False, True])
+def test_typed_actual_keyonly_custody_no_stale_authority(probe, tmp_path, mutate):
+    path = tmp_path / 'synthetic-key.json'
+    path.write_text(json.dumps({'version': 1, 'api_key': KEY}))
+    path.chmod(0o600)
+    p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=str(path)))
+    loader = p0auth.BingCredentialLoader()
+    custody = probe._EgressCustody(loader)
+
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"d":[{"Url":"https://custody.example.com/","IsVerified":false}]}'
+
+        def close(self):
+            if mutate:
+                path.chmod(0o644)
+
+    sends = []
+
+    def send(request):
+        sends.append(True)
+        return httpx.Response(200, stream=Stream())
+
+    client = probe.RawInventoryProbe(custody, transport=httpx.MockTransport(send), max_retries=0)
+    try:
+        result = probe.run_probe(client)
+        expected = (receipt(error='credentials_invalid') if mutate else
+                    receipt([{'Url': 'https://custody.example.com/', 'IsVerified': False}]))
+        assert result == expected and sends == [True]
+        assert custody._keys == [KEY]
+        # Explicit reconfiguration revokes this loader, even with the same path.
+        p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=str(path)))
+        assert probe.run_probe(client) == receipt(error='credentials_invalid')
+        assert sends == [True]
+    finally:
+        custody._keys.clear()
+        p0auth.configure_bing_auth(SimpleNamespace(bing_credentials_file=None))

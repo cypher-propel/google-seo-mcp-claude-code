@@ -11,6 +11,10 @@ from ..gsc.dates import period as gsc_period
 from ..guardrails import with_meta
 
 
+from ..auth import is_hosted_production
+from ..gsc.tools import analytics as _gsc_analytics
+from ..google_accounts.routing import _property_id
+
 def opportunity_matrix(
     site_url: str,
     property_id: int | str,
@@ -38,13 +42,13 @@ def opportunity_matrix(
         min_impressions: minimum GSC impressions to be a candidate.
         top_n: max rows returned (default 20).
     """
-    pid = normalize_property(property_id)
+    pid = _property_id(property_id) if is_hosted_production() else normalize_property(property_id)
     gsc_start, gsc_end = gsc_period(days)
     ga_start, ga_end = ga_period(days)
 
     # ── 1) GSC: pages with quick-win potential ─────────────
-    gsc_rows = query_search_analytics(
-        get_webmasters(),
+    gsc_rows = _gsc_analytics._run_query(
+        _gsc_analytics._read_client(site_url, get_webmasters), query_search_analytics,
         site_url,
         gsc_start,
         gsc_end,
@@ -92,7 +96,7 @@ def opportunity_matrix(
         if not path or path in ga4_by_path:
             continue
         rows = run_report(
-            pid,
+            property_id if is_hosted_production() else pid,
             start_date=ga_start,
             end_date=ga_end,
             metrics=["sessions", "conversions", "totalRevenue", "engagementRate"],

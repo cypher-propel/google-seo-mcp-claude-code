@@ -7,20 +7,49 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
+from copy import deepcopy
 from typing import Any
 
-from ..auth import get_data_client, normalize_property
+from ..auth import (
+    get_data_client,
+    get_google_account_registry,
+    is_hosted_production,
+    normalize_property,
+)
+from ..google_accounts.models import GoogleRequestDeadline
 
 log = logging.getLogger(__name__)
 
 _schema_by_property: dict[str, dict] = {}
+# Hosted values never share the legacy property-only cache or caller-owned data.
+_schema_by_partition: dict[tuple, dict] = {}
+_schema_lock = threading.Lock()
+_schema_epoch = 0
+
+
+def _metadata_executor(property_id):
+    deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+    return get_google_account_registry().router.for_ga4(property_id, deadline)
+
+
+def _fetch_bound_metadata(sdk, property_id):
+    return _serialize_metadata(sdk.ga4_data.get_metadata(name=f"{property_id}/metadata"))
 
 
 def _fetch_metadata(property_id: int | str) -> dict:
+    if is_hosted_production():
+        executor = _metadata_executor(property_id)
+        return executor.execute(lambda sdk: _fetch_bound_metadata(sdk, executor.property_id))
     pid = normalize_property(property_id)
     name = f"{pid}/metadata"
     md = get_data_client().get_metadata(name=name)
+    return _serialize_metadata(md)
 
+
+def _serialize_metadata(md) -> dict:
+    """Keep protobuf reads inside the account execution lock."""
     dims = []
     for d in md.dimensions:
         dims.append({
@@ -45,6 +74,28 @@ def _fetch_metadata(property_id: int | str) -> dict:
 
 def get_schema(property_id: int | str) -> dict:
     """Returns the cached schema for a property, fetching once."""
+    if is_hosted_production():
+        executor = _metadata_executor(property_id)
+        key = (*executor.cache_partition, "metadata")
+        with _schema_lock:
+            epoch = _schema_epoch
+
+        def read(sdk):
+            # execute re-admits fresh membership even on a cache hit. Copy both
+            # ways so caller mutation cannot poison another authorized request.
+            with _schema_lock:
+                cached = _schema_by_partition.get(key)
+                if cached is not None:
+                    return deepcopy(cached)
+            return _fetch_bound_metadata(sdk, executor.property_id)
+
+        result = executor.execute(read)
+        # Only commit after executor JSON/privacy/generation/deadline validation.
+        # A concurrent invalidation must not be undone by an in-flight fetch.
+        with _schema_lock:
+            if epoch == _schema_epoch:
+                _schema_by_partition[key] = deepcopy(result)
+        return result
     pid = normalize_property(property_id)
     if pid not in _schema_by_property:
         log.info("Fetching GA4 metadata for %s (cached afterwards)", pid)
@@ -53,10 +104,18 @@ def get_schema(property_id: int | str) -> dict:
 
 
 def invalidate_schema(property_id: int | str | None = None) -> None:
-    if property_id is None:
-        _schema_by_property.clear()
-    else:
-        _schema_by_property.pop(normalize_property(property_id), None)
+    global _schema_epoch
+    pid = normalize_property(property_id) if property_id is not None else None
+    with _schema_lock:
+        _schema_epoch += 1
+        if pid is None:
+            _schema_by_property.clear()
+            _schema_by_partition.clear()
+        else:
+            _schema_by_property.pop(pid, None)
+            for key in tuple(_schema_by_partition):
+                if key[3] == pid:
+                    _schema_by_partition.pop(key, None)
 
 
 def _score(item: dict, terms: list[str]) -> int:

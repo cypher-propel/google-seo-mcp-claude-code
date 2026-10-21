@@ -1,10 +1,36 @@
 """Search Analytics tools — basic queries."""
 from __future__ import annotations
 
-from ..analytics import aggregate_totals, query_search_analytics
-from ...auth import get_webmasters
-from ..dates import period, prior_period
+import time
+
+from ...auth import get_google_account_registry, get_webmasters, is_hosted_production
+from ...google_accounts.models import GoogleRequestDeadline
 from ...guardrails import with_meta
+from ..analytics import aggregate_totals, query_search_analytics
+from ..dates import period, prior_period
+
+
+class _BoundRead:
+    """Request-local property executor, never an unbound hosted SDK handle."""
+
+    def __init__(self, executor):
+        self.executor = executor
+
+
+def _read_client(site_url, legacy_getter):
+    if not is_hosted_production():
+        return legacy_getter()
+    deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+    return _BoundRead(get_google_account_registry().router.for_gsc(site_url, deadline))
+
+
+def _run_query(client, query, *args, **kwargs):
+    # Consume the entire helper's paging loop inside the selected identity lock.
+    # Reusing this executor across windows also reuses its original deadline;
+    # each execution rechecks current generation and fresh property membership.
+    if isinstance(client, _BoundRead):
+        return client.executor.execute(lambda sdk: query(sdk.gsc, *args, **kwargs))
+    return query(client, *args, **kwargs)
 
 
 def search_analytics(
@@ -46,8 +72,8 @@ def search_analytics(
     dim_filter_groups = (
         [{"filters": filters}] if filters else None
     )
-    rows = query_search_analytics(
-        get_webmasters(),
+    rows = _run_query(
+        _read_client(site_url, get_webmasters), query_search_analytics,
         site_url,
         start_date,
         end_date,
@@ -69,9 +95,9 @@ def site_snapshot(site_url: str, days: int = 28) -> dict:
     """Aggregated totals (clicks/impressions/CTR/position) for the last N days vs prior period."""
     cur_start, cur_end = period(days)
     prev_start, prev_end = prior_period(days)
-    wm = get_webmasters()
-    cur = aggregate_totals(query_search_analytics(wm, site_url, cur_start, cur_end))
-    prev = aggregate_totals(query_search_analytics(wm, site_url, prev_start, prev_end))
+    wm = _read_client(site_url, get_webmasters)
+    cur = aggregate_totals(_run_query(wm, query_search_analytics, site_url, cur_start, cur_end))
+    prev = aggregate_totals(_run_query(wm, query_search_analytics, site_url, prev_start, prev_end))
 
     def delta(a: float, b: float) -> dict:
         diff = a - b

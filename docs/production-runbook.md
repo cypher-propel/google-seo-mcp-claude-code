@@ -8,6 +8,69 @@ qualification evidence and operator configuration outside
 the public repository. Never copy secret values into a command line, transcript,
 record, expanded Compose output or image.
 
+## Active agency-union release authority
+
+This is the current dual-user-OAuth/provider-discovery release contract. Historical
+Step 5.2/5.3/5.4 deployment sequences explicitly archived below are not current
+authority. Source completion, offline qualification and Coordinator acceptance are
+different gates; this document grants no enrollment, provider call, merge or deploy.
+
+**ENROLL BEFORE FIRST START**, after Stage C disposition. The enrollment helper
+`scripts/enroll_google_accounts.py` was implemented and offline-qualified; it does
+not still need to be built. Actual desktop-native synthetic dry-pass qualification
+and Chris's real consents/enrollment remain pending. Do not infer native-platform
+qualification from offline fixtures or a source banner. Review the approved
+Desktop custody path and complete the native dry pass before real consent. Keep
+credential documents at rest in the approved vault until gated deployment. Do not
+start a pending production service and then enroll as a final-release workaround.
+Optional/pending readiness remains an offline/isolated-fixture diagnostic, not a
+replacement for this release ordering.
+
+Before consent, the operator inventories and approves the agency-owned OAuth
+project/client, Desktop client type, External audience, In-production publication,
+branding/support/privacy and verification disposition, and enables Search Console,
+Analytics Admin and Analytics Data APIs. Actual approved client/project identifiers
+are operator facts, not examples to invent. External/Testing refresh expiry is not
+an unattended-production solution. Use exactly the two read-only scopes below,
+offline access, `prompt=consent select_account`, `include_granted_scopes=false`,
+single-use state, PKCE S256 and bounded `127.0.0.1` ephemeral loopback callback.
+Reject missing/extra scopes or absent refresh material. No codes or token files in
+chat; no auth URL, callback query, token, secret or token-derived fingerprint in
+receipts. Chris checks the chooser/consent screen and explicitly attests each slot:
+`propel-dms` = `propel.dms@gmail.com`, `addourteam99` = `addourteam99@gmail.com`.
+The scopes do not cryptographically verify email; login hints/property inventory
+are not identity proof. Distinct enrollments are required. Use only the approved
+human-controlled enrollment interface; never improvise a vault connector.
+
+Coordinator release gates remain: independent source and isolated installed-wheel
+qualification, packaging disposition, protected merge, exact clean merged-source
+wheel/image byte and digest proof, final-image audit/hardening, actual native
+interface qualification, protected materialization and only the assigned service
+recreation. The historical Dockerfile wheel digest/member counts and SA defaults
+are **not qualified for this release**. G3/G4 must disposition the new qualified
+wheel/image/config and any exact-path reconciliation; do not regenerate the old
+archive or weaken byte checks. No packaging/native-interface gate is claimed done.
+
+Before deploy the Coordinator records first approved cutover time and an absolute
+SA rollback-snapshot expiry: seven calendar days from that cutover, never from
+later acceptance. Timing changes require explicit predeploy disposition; there is
+no silent extension. Keep the old SA key/config in a separately protected operator
+snapshot, absent from the active OAuth mount/config. Rollback restores explicitly
+old SA-limited visibility, not union acceptance. Existing SA grants/key remain
+unchanged during build/enrollment. At expiry, separate Coordinator/human clearance
+must confirm other-service use before removing this service's grants and retiring
+its key/snapshots. No automatic retirement, project/principal deletion or rotation.
+
+Live acceptance is Coordinator-only: obtain exact GSC and GA4 pilot identifiers
+from the Coordinator's source-validated inventories, not the first result, display
+name or guessed domain/resource. Independently compare both account inventories
+with the complete union; confirm Seacoast's exact identifiers and budget each read.
+Cross-provider legs may select different eligible accounts. Bing inventory/agency
+ownership attestation is separate from Google consent. Missing facts block live
+acceptance. Preserve all existing consumer keys; no rotation/re-enrollment to pass.
+Persist attempted/unknown operator effects and STOP for read-only reconciliation
+before replay; a missing receipt is not proof of zero effects.
+
 ## Runtime contract
 
 `google-seo-mcp` defaults to legacy stdio, with the 113-tool catalog
@@ -16,7 +79,7 @@ production profile: SDK 1 FastMCP, stateless JSON HTTP, one worker/replica,
 `/mcp` and `/mcp/`. There are no legacy `/sse` or `/messages` endpoints. CLI
 transport/host/port options override their environment settings.
 
-The exact hosted catalog is the 46 names in the packaged
+The exact hosted catalog is derived from the names in the packaged
 [`production_tools.json`](../src/google_seo_mcp/production_tools.json): the unchanged
 35 GSC/GA4/cross-platform/SERP reads (including `serp_check`, `serp_aio_monitor`,
 `serp_paa_extractor` and `serp_competitor_intersect`) plus exactly the eleven
@@ -30,7 +93,7 @@ separate `crawl` extra. Legacy stdio IndexNow writes now require the independent
 `GOOGLE_SEO_ALLOW_INDEXNOW=true` opt-in; production always refuses that gate.
 
 Consumer bearer keys provide authentication and attribution. Every consumer uses
-the same server-side Google identity and its approved property grants. Keys do
+the same server-side two-account Google union and upstream property grants. Keys do
 not provide property or tenant isolation. Stop onboarding if that isolation is
 required; it needs a separate authorization design.
 
@@ -71,7 +134,7 @@ Only minimal liveness and local-peer readiness bypass bearer authentication.
 | Endpoint/state | Meaning |
 | --- | --- |
 | `GET /healthz`, 200 `{"status":"ok"}` | Minimal process liveness; no credential or provider check. |
-| Local `GET /readyz`, 200, `transport_ready=true`, `status=credential-pending` | Transport ready with intentionally absent Google file when credentials are optional. |
+| Local `GET /readyz`, 200, `transport_ready=true`, `status=credential-pending` | Optional fixture/diagnostic mode with absent OAuth material; not final-release start authority. |
 | Local `/readyz`, `credentials-invalid` | Local file/schema invalid; investigate without printing it. Optional mode can still return 200. |
 | Local `/readyz`, `transport-ready`, credentials `available` | Offline local file/schema availability only; Google grants/token refresh remain unverified. |
 | Local `/readyz`, 503 | Transport not ready, or required credentials missing/invalid. |
@@ -81,7 +144,8 @@ requests receive 403. Use operator host-local smoke over enrolled SSH rather
 than opening readiness externally. Neither health, initialization nor tool
 listing constructs/refreshes Google credentials or contacts a business API.
 `GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS=false` is the credential-pending mode.
-Enable required mode only for the separately authorized operational phase.
+Final release requires both slots locally ready and separate authorized provider
+acceptance; the optional default is not an enroll-after-start procedure.
 
 `GOOGLE_SEO_REVISION` is baked by the image build and copied into the OCI revision
 label. Supply the exact reviewed 40-character lowercase Git SHA. Unknown/absent
@@ -100,9 +164,9 @@ dumps. Presence is established by successful authenticated behavior.
 
 The protected directory is mounted read-only at `/run/secrets`, with
 `create_host_path:false`. It must already exist. It contains the required
-`consumer-keys.json` and may initially omit `google-seo-service-account.json`.
-Mounting a directory permits the absent Google file without Docker creating a
-placeholder directory at a missing individual-file source.
+`consumer-keys.json` and, at gated deployment, the three fixed OAuth documents
+listed below. No active SA document belongs in that mount. Optional absent-file
+fixtures must not be confused with final-release enrollment ordering.
 
 The registry schema is JSON `version` integer 1 and `consumers`, a nonempty
 array of entries containing exactly `consumer_id`, `key_id`, `sha256`, `enabled`.
@@ -118,24 +182,47 @@ Keep the directory operator-owned and restricted, with traversal and file-read
 permissions only for the operator/service group used by UID/GID 10001 (for
 example directory 0750 and files 0640 with the correct group). Verify permissions
 and presence without reading contents into output. These registry/Google
-instructions do not replace Bing's enforced custody checks below. Rotation uses
+instructions do not replace Bing's enforced custody checks below. No consumer
+rotation is authorized for this release. Separately authorized rotation uses
 atomic registry replacement and recreation of only this service; the in-memory
 registry does not hot-reload.
 Verify revoked-key denial and new-key acceptance after recreation using approved
 injection. Preserve revocations through code rollback. Any overlap needs approval.
 
-Hosted auth reads only `GOOGLE_SEO_SERVICE_ACCOUNT_FILE`. No ADC, metadata server,
-cached OAuth token, browser or developer HOME fallback exists. One shared service
-account requests exactly:
+Hosted production uses only `GOOGLE_SEO_AUTH_MODE=dual-user-oauth`; SA or mixed
+configuration is rejected. The exact source-derived fields and direct-process
+environment names are:
+
+| Runtime field | Environment name | Fixed protected container path / binding |
+| --- | --- | --- |
+| `google_oauth_client_file` | `GOOGLE_SEO_OAUTH_CLIENT_FILE` | `/run/secrets/google-seo-oauth-client.json` |
+| `google_oauth_propel_dms_file` | `GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE` | `/run/secrets/google-seo-oauth-propel-dms.json` |
+| `google_oauth_addourteam99_file` | `GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE` | `/run/secrets/google-seo-oauth-addourteam99.json` |
+| `google_approved_client_id` | `GOOGLE_SEO_APPROVED_CLIENT_ID` | Operator-approved client ID; no invented default |
+| `google_approved_project_id` | `GOOGLE_SEO_APPROVED_PROJECT_ID` | Operator-approved project ID; no invented default |
+| `require_google_credentials` | `GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS` | Source default `false`; final-release readiness requires both slots |
+
+Compose fixes container paths; the env example is not a path override. Confirm
+protected directory traversal, owner/mode, no-follow leaf/parent and bounded
+strict-JSON custody under the approved service identity **before** retrieving
+documents. Use only the existing approved materializer; if it cannot deliver the
+exact paths, STOP before fetch, never widen permissions. No SA, ADC, metadata,
+gcloud/HOME cache or runtime browser fallback exists. Both accounts request exactly:
 
 - `https://www.googleapis.com/auth/webmasters.readonly`
 - `https://www.googleapis.com/auth/analytics.readonly`
 
-Operators later enroll the file and grant only approved GSC Restricted/read and
-GA4 Viewer access. No owner/editor, indexing scope or domain-wide delegation is
-needed. Missing credentials yield sanitized `credentials_missing` on tool calls
-without an outbound attempt. Malformed/provider failures are sanitized. Production
-rejects write/private/local/debug gates even when given a truthy override.
+Enrollment is before first release start as gated above. No owner/editor, indexing
+scope or domain-wide delegation is needed. Listings expose a deterministic exact
+union, not a one-working-account subset. Incomplete discovery returns explicit
+`agency_discovery_incomplete`. GSC domain and URL-prefix identifiers stay distinct;
+GA4 deduplicates canonical `properties/<digits>`, not display names. Unverified GSC
+rows cannot authorize reads. Every property read (including cache hits) requires
+fresh discovery/generation admission; prefer `propel-dms` only among eligible
+accounts, with no alternate-account retry after provider failure. Discovery and
+business share one 60-second deadline; local 10,000-property/1,000-page ceilings
+fail incomplete, not truncated success. Production rejects write/private/local/
+debug gates even when given a truthy override.
 
 DataForSEO uses server-side injected `DATAFORSEO_LOGIN` and
 `DATAFORSEO_PASSWORD`, fixed vendor endpoints and bounded requests. Missing
@@ -143,7 +230,7 @@ credentials fail without DNS/request. The vendor is billable. No Google business
 or paid vendor tool is part of this transport smoke; operational provider testing
 and consumer wiring require their separate gate. Do not use `get_capabilities`
 as a smoke substitute. Google credential enrollment, property grants and live
-Google/DataForSEO verification remain Step 5.3 work.
+Google/DataForSEO verification remain separately gated operator work.
 
 Hosted SERP responses must contain a coherent successful task/result with an
 explicit list of items. An explicit empty list is a qualified empty observation;
@@ -152,36 +239,36 @@ missing, null, malformed or errored observations yield sanitized
 explicit per-item errors. Inspect those payload errors before interpreting a
 negative finding or a completed call as a provider result.
 
-## Optional Bing Webmaster provider — Step 5.4
+## Bing Webmaster provider — active discovery contract
 
-This section governs the additive Bing release on the existing Google service;
-it is not a claim that any gate has run. Historical initial-route/Google-enrollment
-procedures later in this document do not authorize redoing those operations.
-Preserve the existing Google credentials, grants, DataForSEO injection, consumer
-registry, ingress/auth design and all Compose hardening/resources.
+This section describes provider-backed admission, not a claim of live acceptance.
+Preserve the existing Bing key, DataForSEO injection, consumer registry, ingress/
+auth design and all Compose hardening/resources. Google changes only through the
+explicit dual-OAuth cutover above; historical additive-release instructions below
+cannot authorize a different sequence.
 
 ### Exact path-only configuration and readiness
 
-Only these three Bing runtime fields/environment names are supported:
+Only these two Bing runtime fields/environment names are supported:
 
 | Runtime field | Environment name | Default |
 | --- | --- | --- |
 | `bing_credentials_file` | `GOOGLE_SEO_BING_CREDENTIALS_FILE` | `/run/secrets/bing-webmaster.json` |
-| `bing_sites_file` | `GOOGLE_SEO_BING_SITES_FILE` | `/run/secrets/bing-sites.json` |
 | `require_bing_credentials` | `GOOGLE_SEO_REQUIRE_BING_CREDENTIALS` | `false` |
 
-Compose fixes the two container paths, like its Google/registry paths; the env
+Compose fixes the credential container path, like its Google/registry paths; the env
 example documents them for direct processes, not Compose path overrides. Only
-its Bing-required boolean is forwarded. There is no fourth field, API-key env
+its Bing-required boolean is forwarded. There is no policy field, API-key env
 fallback, HOME lookup, OAuth/browser/Google credential fallback, caller key/path,
-account selector or configurable upstream endpoint. Keep required mode **false**
-through credential-pending deployment and until the later separately authorized
-grant/provider qualification; switching it is not a grant check.
+account selector or configurable upstream endpoint. The source default is **false**;
+any change requires separate operator authorization. A credential-pending fixture
+or flipping the boolean is not grant qualification or release-start authority.
 
 Reuse the existing protected directory bind at `/run/secrets`, read-only with
 `create_host_path:false`. No additional mount, individual-file placeholder,
-service or secret materializer is introduced. Bing files remain absent until the
-HOLD/resume gate below. The template's `/etc/propel-mcp/google-seo` source directory
+service or secret materializer is introduced. Preserve existing enrolled key
+custody; any new materialization must await the active HOLD/resume gate below.
+The template's `/etc/propel-mcp/google-seo` source directory
 is a documented example, **not a verified live path**. The parent operator must
 inspect the approved deployed layout, mirror the existing DataForSEO deployment
 custody pattern outside Git, and reconcile its actual protected directory/mount
@@ -190,10 +277,9 @@ to match the example.
 
 Local `/readyz` adds only `bing_credentials_state`:
 
-- `pending`: either document absent, unless a present document is invalid.
-- `invalid`: malformed/unreadable/unprotected key or policy, policy mismatch, or
-  observed custody/fingerprint change. Present invalid takes precedence over absence.
-- `available`: both bounded documents pass local schema/custody, **not** current
+- `pending`: key document absent.
+- `invalid`: malformed/unreadable/unprotected key or observed custody change.
+- `available`: the bounded key document passes local schema/custody, **not** current
   Bing grants, verification, token validity, API access or business usefulness.
 
 With optional Bing, all existing Google readiness/status decisions are unchanged:
@@ -204,7 +290,7 @@ returns explicit `unavailable` / `provider_not_configured` before DNS/client
 construction; invalid files fail closed, never empty business success. Catalog
 listing and successful HTTP dispatch are not provider qualification.
 
-### Operator custody and exact approved site policy
+### Operator key-only custody and fresh provider admission
 
 The operator enrolls the **EXISTING** Bing Webmaster key in Infisical project
 `cypher`, environment `prod`, named `BING_WEBMASTER_API_KEY`. Do not generate,
@@ -217,24 +303,20 @@ Only after the resume gate may the approved injector materialize a strict JSON
 credential document: exactly `version` (integer `1`) and `api_key` (bounded,
 nonempty string; no control characters), maximum **16 KiB** file size. Do not
 paste a literal key or a placeholder credential document into this runbook.
-The separate **nonsecret** policy file is maximum **64 KiB** and must contain
-exactly this singleton, with no aliases, alternate host/scheme, implicit default
-or additional sites:
+The key document rejects unknown fields, duplicate JSON keys and invalid schemas.
+The retired policy document is not read or an authorizer; leftover-file retirement
+needs a separate approved operator change. No hardcoded site allowlist filters
+discovery. All consumers share the existing agency Bing identity, not tenant
+isolation. Listing includes valid strict `is_verified=false` entries and omits
+verification codes; provider completeness remains unknown. Business reads require
+exact membership with strict `IsVerified=true` in fresh validated `GetUserSites`
+discovery. Missing/unverified sites deny the business call; malformed/conflicting/
+dropped discovery rows cannot authorize. Typed discovery faults remain faults, not
+empty inventory or site denial. Provider grants remain authoritative; discovery
+and business are not an atomic authorization snapshot. Multiple required agency
+identities STOP for a contract amendment, never key substitution or extra enrollment.
 
-```json
-{"version":1,"sites":["https://kelleyconstructioninc.com/"]}
-```
-
-Both documents reject unknown fields, duplicate JSON keys and invalid schemas.
-Protect the nonsecret policy exactly like the credential: static admission is an
-authorization boundary, not proof of provider-side grants or tenant isolation.
-All consumers share one Bing identity and this approved site; bearer keys provide
-authentication/attribution only. Discovery returns approved verified observations
-without verification codes. Business reads enforce the static policy and rely
-on Bing to enforce current grants; they perform no hidden verification preflight.
-Operator policy removal/revocation is required on grant drift; denial is not empty.
-
-For **both** files verify metadata without emitting contents: regular file,
+For the **key** file verify metadata without emitting contents: regular file,
 owner root or the service UID **10001**, service-readable (for example root:10001
 or 10001:10001, mode **0640**), exactly one hardlink, no symlink at the leaf or
 any parent component. The immediate parent must be root/service-owned and not
@@ -245,7 +327,7 @@ state. The loader enforces bounded no-follow reads and rechecks configured-path
 custody; these instructions do not certify filesystem atomicity between checks.
 
 Composition captures paths, and the first local inspection pins custody state.
-Any key/policy replacement, permissions/ownership change, addition after absence
+Any key replacement, permissions/ownership change, addition after absence
 or rotation requires **explicit service recreation** and a fresh loader; no
 hot-reload or stale-key fallback. Invalid custody latches fail-closed even if the
 file is restored. Rotation/revocation requires separate operator approval and
@@ -297,9 +379,54 @@ GSC-parity claim; `IsPage` is not proof of indexing. Sitemaps return feed metada
 not full sitemap URL enumeration. Empty/partial/deferred/denied/provider-error
 outcomes must stay distinct from positive data and business qualification.
 
-### Mandatory staged release, HOLD and later live acceptance
+### Active smoke accounting and operator handoff
 
-These are **parent-operator-only future gates**, not commands for a local builder:
+`scripts/smoke_http.py` is catalog-only and makes zero `tools/call` requests; it
+selects no Google property. Both smoke helpers derive the catalog from the
+installed packaged manifest and retain independent frozen OLD/BING guard sets.
+Do not treat a source import or an old installed manifest as new-image proof.
+
+`scripts/smoke_bing.py` keeps its closed eleven names, fixed hosted origin and
+explicit Kelley pilot; this existing restricted pilot is not a first-property
+selector or authorization to substitute Seacoast/another site. The Coordinator
+must confirm that exact pilot for this invocation; any different pilot requires
+separate disposition, not a source edit or invented ID. Live mode requires the
+trusted parent qualification receipt before bearer lookup/network, parent readback
+of exact qualified image/revision/composition and explicit live-budget authority.
+The receipt is not cryptographic authorization. Preserve HOLD and a subsequent
+Coordinator key-enrolled/resume record for Bing wiring; do not fetch/materialize
+the existing key merely because a source task completed. Reuse existing consumer
+and provider keys, never rotate them to satisfy smoke.
+
+One attempt per named MCP call means at most eleven SDK calls, no replay. The
+theoretical full-success zero-retry upstream upper bound is **21**:
+**1 listing + 10*(fresh discovery + business)**. It is not an observed attempt
+counter or permission to spend 21 calls. Per-tool upstream attempts remain
+`unobservable_from_hosted_protocol`; deferred names make no call. The receipt's
+`qualified_upstream_attempts_upper_bound` records that composition bound and
+`attempt_bound_basis` names listing/fresh-discovery/business, not SDK-call equality.
+Synthetic eleven-call fixtures are not real upstream counts or live-budget proof.
+
+Keep the existing local safeguards: **12 attempts per rolling 60 seconds, one
+in-flight attempt, 15-second attempt ceiling, 60-second shared caller deadline**,
+2 MiB bound and zero retries. Each fresh discovery consumes the same rate budget
+as business; the eleven-name sequence is not guaranteed to fit the rolling window.
+No automatic sleeps, pacing, retries or quota expansion are authorized. A typed
+fault, including a non-null error on a partial result or rate refusal, is a visible
+STOP; preserve sanitized status/error/source/returned/dropped/truncation/warnings,
+consume that attempted name and do not continue or silently call it empty success.
+Unknown outcomes require parent read-only reconciliation, not replay. Preserve
+precredential zero-call refusal, redirect/proxy/privacy/selector controls and
+fixed origin. No live or synthetic smoke is executed by this source-only row.
+
+### ARCHIVE — original Step 5.4 staged deployment (not active authority)
+
+The entire sequence through its rollback paragraph below is retained historical
+context only. Its pending-first deployment, static policy wiring and original
+single-discovery accounting are superseded above. Do not execute it for the
+agency-union release; it cannot waive enroll-before-first-start or grant calls.
+
+The following numbered sequence is **historical only**, not future authorization:
 
 1. Complete independent offline source/fresh-wheel qualification and triage.
    GitHub-first protected PR/merge; verify qualified-head/merged-tree equality.
@@ -381,7 +508,11 @@ business success: a returned payload can contain explicit errors, including
 partial batch errors. Check the payload and its provenance separately. Request
 status and audit outcome likewise describe transport/dispatch behavior.
 
-## Authorized release build and qualification
+## ARCHIVE — original release build recipe (not current packaging approval)
+
+The recipe below preserves the earlier release procedure, not approval to use the
+historical pinned wheel/Dockerfile for dual OAuth. New G3/G4 disposition and exact
+qualified wheel/image digest/member verification are required before adaptation.
 
 Use an authorized linux/amd64 build environment with Docker Buildx and approved
 standard packaged Syft/Trivy tooling. Record tool provenance/checksums, versions
@@ -480,7 +611,11 @@ release mechanism and retain the immutable registry digest. Configure Compose
 with that digest, never a mutable `latest`-only tag. Verify the pulled image
 matches the qualified SHA/digest and preserve candidate/rollback artifacts.
 
-## Hardened image and transport smoke
+## Archived fixture procedure — hardened image and transport smoke
+
+These are isolated synthetic pending-mode fixtures only, not production startup
+or enrollment ordering. Run only under separate operator qualification authority.
+Current helpers use the packaged manifest rather than an invented catalog count.
 
 Before release acceptance, test the final image on the authorized release builder
 with the actual Compose security/resource settings. If this is the deployment
@@ -524,7 +659,7 @@ smoke helper can instead use `--check-local-readiness --expected-revision
 The helper validates TLS by default, ignores ambient proxy/CA environment,
 refuses every redirect, checks no-key 401 and minimal health, then uses the real
 SDK to initialize and exhaust `tools/list` pagination. It compares all unique
-names with the installed 46-tool manifest. It makes no `tools/call` request.
+names with the installed packaged manifest. It makes no `tools/call` request.
 Its only output is sanitized status/count/revision; public smoke reports revision
 `unavailable` because readiness is local-only. Cleartext is allowed only when
 `--allow-http-host` exactly matches an approved literal loopback/RFC1918/ULA/
@@ -547,7 +682,13 @@ cleanup, so retain the observed signal result plus shutdown evidence. Check
 read-only mounts, no socket/HOME, user, caps, limits and logging with narrowly
 projected inspect output; never dump full container environment/configuration.
 
-## Rollout, canary and rollback
+## ARCHIVE — initial rollout, canary and rollback sequence
+
+The initial new-route/pending-first sequence below is historical, not active
+agency-union deployment authority. Preserve its safety/canary/unknown-outcome
+constraints where applicable; current enrollment ordering, cutover authorization
+and absolute SA rollback expiry above take precedence. No initial-route operation
+is authorized to be repeated by this document.
 
 The parent release operator owns GitHub commit/PR/protected merge, release build,
 final-image audit, deployment, secret enrollment, public edge/TLS routing and

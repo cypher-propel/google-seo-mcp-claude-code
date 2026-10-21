@@ -28,7 +28,8 @@ class HealthStatus(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     status: Literal["not-ready", "credential-pending", "credentials-invalid", "transport-ready"]
     transport_ready: bool
-    google_credentials_state: Literal["pending", "invalid", "available"]
+    google_credentials_state: Literal["missing", "invalid", "available"]
+    google_credentials_required: bool
     bing_credentials_state: Literal["pending", "invalid", "available"]
     revision: str
 
@@ -81,10 +82,27 @@ def create_http_app(
     sdk_handler = sdk_routes[0].endpoint
     transport_ready = False
     revision = _release_revision()
+    google_registry = auth.get_google_account_registry()
+    if google_registry.config != config:
+        raise ValueError("invalid HTTP application configuration")
+
+    def google_state():
+        # An application cannot report another composition's custody as its own.
+        try:
+            current = auth.get_google_account_registry()
+        except RuntimeError:
+            return "invalid"
+        if current is not google_registry:
+            return "invalid"
+        return auth.google_credentials_state()
 
     @asynccontextmanager
     async def lifespan(application: Starlette):
         nonlocal transport_ready
+        if config.require_google_credentials:
+            state = google_state()
+            if state != "available":
+                raise RuntimeError("credentials_missing" if state == "missing" else "credentials_invalid")
         # The SDK-created Starlette app is not mounted or separately started:
         # this is the only session_manager.run() call in the composition.
         async with mcp.session_manager.run():
@@ -99,11 +117,11 @@ def create_http_app(
 
     async def readyz(request: Request) -> JSONResponse:
         # Both states inspect bounded local custody only, never provider grants.
-        state = auth.google_credentials_state()
+        state = google_state()
         bing_state = bing_credentials_state()
         status = (
             "not-ready" if not transport_ready else
-            "credential-pending" if state == "pending" else
+            "credential-pending" if state == "missing" else
             "credentials-invalid" if state == "invalid" else
             "credential-pending" if config.require_bing_credentials and bing_state == "pending" else
             "credentials-invalid" if (
@@ -112,11 +130,12 @@ def create_http_app(
         )
         ready = (
             transport_ready
-            and (not config.require_google_credentials or state == "available")
+            and state == "available"
             and (not config.require_bing_credentials or bing_state == "available")
         )
         health = HealthStatus(
             status=status, transport_ready=transport_ready,
+            google_credentials_required=config.require_google_credentials,
             google_credentials_state=state, bing_credentials_state=bing_state, revision=revision,
         )
         return JSONResponse(

@@ -7,7 +7,7 @@ Single entry point that requests BOTH scopes (`webmasters.readonly` +
   - GA4 Admin API v1beta (account/property listing)
   - GA4 Data API v1beta (run_report, run_realtime_report)
 
-Resolution order:
+Legacy-only resolution order (hosted uses an explicit dual-account registry):
   1. ADC — `GOOGLE_APPLICATION_CREDENTIALS` env or default `gcloud` ADC file.
   2. Service account — `GOOGLE_SEO_SERVICE_ACCOUNT_FILE`.
   3. OAuth user flow — `GOOGLE_SEO_OAUTH_CLIENT_FILE` (Desktop client JSON).
@@ -25,7 +25,6 @@ from typing import Any
 from google.analytics.admin_v1beta import AnalyticsAdminServiceClient
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.auth import default as google_auth_default
-from google.auth.crypt import RSASigner
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -68,16 +67,14 @@ _credentials_fingerprint: str | None = None
 # Set only by the composition root after validating the runtime boundary.  A
 # hosted process never consults the legacy credential cascade or developer HOME.
 _hosted_auth_enabled = False
-_hosted_service_account_file: Path | None = None
-_hosted_credentials: Any = None
-_hosted_credentials_invalid = False
-_hosted_file_fingerprint: tuple[int, ...] | None = None
-_hosted_file_valid = False
+_auth_profile_captured = False
 
 
 def is_hosted_production() -> bool:
-    """Also fail closed for direct helper use before composition is complete."""
-    return _hosted_auth_enabled or os.getenv("GOOGLE_SEO_PROFILE", "").lower() == "production"
+    """Captured policy wins; before composition ambient production fails closed."""
+    if _auth_profile_captured:
+        return _hosted_auth_enabled
+    return os.getenv("GOOGLE_SEO_PROFILE", "").lower() == "production"
 
 
 def hosted_auth_enabled() -> bool:
@@ -85,138 +82,210 @@ def hosted_auth_enabled() -> bool:
     return _hosted_auth_enabled
 
 
-def configure_hosted_auth(config: Any) -> None:
-    """Select the validated identity without opening files or contacting Google.
+def production_writes_disabled() -> bool:
+    """Deny writes for captured production or raw production, never grant them."""
+    return (
+        is_hosted_production()
+        or os.getenv("GOOGLE_SEO_PROFILE", "").lower() == "production"
+    )
 
-    Legacy stdio retains its existing credential resolution.  Reconfiguring a
-    process clears all clients so one identity cannot reuse another's clients.
+
+_hosted_registry = None
+
+
+def _clear_google_caches() -> None:
+    # Do not import consumer modules (or construct clients) during configuration.
+    import sys
+    schema = sys.modules.get("google_seo_mcp.ga4.schema")
+    if schema is not None:
+        schema.invalidate_schema()
+
+
+def _raise_private(error: Exception) -> None:
+    """Raise a newly normalized refusal without retaining even ambient context."""
+    try:
+        raise error from None
+    except Exception:
+        error.__context__ = error.__cause__ = None
+        raise
+
+
+def _owned_cleanup(*attempts) -> None:
+    """Attempt every owned action; first encountered control wins, not ambient state."""
+    from .google_accounts.models import GoogleAccountError
+    control = None
+    failed = False
+    for attempt in attempts:
+        try:
+            attempt()
+        except Exception:
+            failed = True
+        except BaseException as error:
+            if control is None:
+                control = error
+    if control is not None:
+        raise control
+    if failed:
+        _raise_private(GoogleAccountError("credentials_invalid"))
+
+
+class _HostedLoader:
+    """Revocable composition lease around the qualified immutable custody epoch."""
+
+    def __init__(self, config):
+        from .google_accounts.credentials import GoogleCredentialLoader
+        self.loader = GoogleCredentialLoader(
+            approved_client_id=config.google_approved_client_id,
+            approved_project_id=config.google_approved_project_id,
+            client_file=config.google_oauth_client_file,
+            propel_dms_file=config.google_oauth_propel_dms_file,
+            addourteam99_file=config.google_oauth_addourteam99_file,
+        )
+        self.revoked = False
+        self.lock = threading.RLock()
+
+    def _call(self, operation):
+        from .google_accounts.models import GoogleAccountError
+        primary_control = None
+        failure = "credentials_invalid"
+        with self.lock:
+            if self.revoked:
+                _raise_private(GoogleAccountError("credentials_changed"))
+            try:
+                return operation()
+            except GoogleAccountError as error:
+                failure = error.code
+            except Exception:
+                pass
+            except BaseException as error:
+                primary_control = error
+            # A standalone lease owns only cache cleanup, never client retirement.
+            try:
+                _owned_cleanup(_clear_google_caches)
+            except Exception:
+                pass
+            except BaseException:
+                if primary_control is None:
+                    raise
+            if primary_control is not None:
+                raise primary_control
+            _raise_private(GoogleAccountError(failure))
+
+    def load_accounts(self):
+        return self._call(self.loader.load_accounts)
+
+    def generation(self):
+        return self._call(self.loader.generation)
+
+
+class _HostedRegistry:
+    """Explicit services, never a mutable current account or an SDK singleton."""
+
+    def __init__(self, config):
+        from .google_accounts.clients import GoogleAccountClients
+        from .google_accounts.discovery import GooglePropertyDiscovery
+        from .google_accounts.routing import GooglePropertyRouter
+        self.config = config
+        self.loader = _HostedLoader(config)
+        self.clients = GoogleAccountClients(self.loader)
+        self.discovery = GooglePropertyDiscovery(self.clients)
+        self.router = GooglePropertyRouter(self.clients, self.discovery)
+
+    def retire(self):
+        from .google_accounts.models import GoogleAccountError
+        # Revoke before flushing/retiring; active workers retain qualified ownership.
+        with self.loader.lock:
+            self.loader.revoked = True
+
+        def retire_clients():
+            try:
+                self.clients.generation()
+            except GoogleAccountError:
+                # Revoked generation is expected; qualified clients have already
+                # poisoned admissions and attempted every idle owned close.
+                pass
+
+        _owned_cleanup(retire_clients, _clear_google_caches)
+
+    def __repr__(self):
+        return "<HostedGoogleRegistry private>"
+
+
+def configure_hosted_auth(config: Any) -> None:
+    """Capture validated explicit custody without credential I/O or network.
+
+    Independent processes remain the supported lifecycle. Reconfiguration revokes
+    every retained old adapter before admitting the replacement registry.
     """
-    global _hosted_auth_enabled, _hosted_service_account_file
-    global _hosted_credentials, _hosted_credentials_invalid, _credentials_fingerprint
-    global _hosted_file_fingerprint, _hosted_file_valid
+    from .runtime_config import ProductionRuntimeConfig
+    invalid = False
+    try:
+        if not isinstance(config, ProductionRuntimeConfig):
+            invalid = True
+        else:
+            config = ProductionRuntimeConfig.model_validate(config.model_dump(warnings=False))
+    except Exception:
+        invalid = True
+    if invalid:
+        _raise_private(ValueError("invalid runtime configuration"))
+    global _hosted_auth_enabled, _auth_profile_captured, _hosted_registry, _credentials_fingerprint
     global _searchconsole_service, _webmasters_service, _ga4_data_client, _ga4_admin_client
     with _auth_lock:
-        _hosted_auth_enabled = getattr(config, "profile", None) == "production"
-        sa_file = getattr(config, "service_account_file", None)
-        _hosted_service_account_file = Path(sa_file) if _hosted_auth_enabled and sa_file else None
-        _hosted_credentials = None
-        _hosted_credentials_invalid = False
-        _hosted_file_fingerprint = None
-        _hosted_file_valid = False
+        previous, _hosted_registry = _hosted_registry, None
+        # Capture separately from mode: any fallible replacement stays closed.
+        _auth_profile_captured = True
+        _hosted_auth_enabled = True
         _credentials_fingerprint = None
         _searchconsole_service = _webmasters_service = None
         _ga4_data_client = _ga4_admin_client = None
+        attempts = (
+            (previous.retire, _clear_google_caches)
+            if previous is not None else (_clear_google_caches,)
+        )
+        _owned_cleanup(*attempts)
+        if config.profile == "production":
+            _hosted_registry = _HostedRegistry(config)
+        _hosted_auth_enabled = config.profile == "production"
+
+
+def get_google_account_registry():
+    """Hosted explicit discovery/router seam; no credential load at retrieval.
+
+    Enumeration: registry.discovery.list_rows(provider, deadline). Business:
+    registry.router.for_gsc/for_ga4(property, deadline).execute(callback).
+    Callbacks return bounded JSON, consume SDK pages in the account lock, and
+    include cache_partition plus parameters when using consumer-owned caches.
+    """
+    from .google_accounts.models import GoogleAccountError
+    if not is_hosted_production() or _hosted_registry is None:
+        raise GoogleAccountError("credentials_missing")
+    return _hosted_registry
 
 
 def google_credentials_state() -> str:
-    """Offline file/schema availability; never an assertion of Google access.
+    """Local exact-pair custody only; available never means valid grants.
 
-    Only the configured service-account file is inspected.  No credential
-    constructor, token refresh, ADC lookup or OAuth cache creation occurs here.
+    Both slots and the approved client are admitted together by the qualified
+    loader. There is no per-slot subset success or refresh/network validation.
+    Missing binding is missing custody, never inferred from document contents.
     """
-    if not is_hosted_production() or _hosted_service_account_file is None:
-        return "pending"
+    if not is_hosted_production() or _hosted_registry is None:
+        return "missing"
+    registry = _hosted_registry
+    failure = None
     try:
-        _validate_hosted_service_account_file()
-    except FileNotFoundError:
-        return "pending"
-    except Exception:
-        return "invalid"
-    return "invalid" if _hosted_credentials_invalid else "available"
+        registry.clients.generation()
+    except Exception as error:
+        failure = getattr(error, "code", "credentials_invalid")
+    if failure is not None:
+        _clear_google_caches()
+    return "available" if failure is None else (
+        "missing" if failure == "credentials_missing" else "invalid"
+    )
 
 
-def _validate_hosted_service_account_file() -> None:
-    """Cache only validation status, never parsed JSON or signing material."""
-    global _hosted_file_fingerprint, _hosted_file_valid
-    if _hosted_service_account_file is None:
-        raise FileNotFoundError
-    stat = _hosted_service_account_file.stat()
-    fingerprint = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
-    if fingerprint == _hosted_file_fingerprint:
-        if not _hosted_file_valid:
-            raise ValueError("invalid service-account file")
-        return
-    try:
-        _read_hosted_service_account_info()
-    except Exception:
-        _hosted_file_fingerprint, _hosted_file_valid = fingerprint, False
-        raise
-    _hosted_file_fingerprint, _hosted_file_valid = fingerprint, True
 
 
-def _read_hosted_service_account_info() -> dict[str, Any]:
-    """Bounded local validation, including fixed credential refresh destination.
-
-    This intentionally does not construct Google credentials or validate grants.
-    The caller sanitizes every parse/I/O error before it crosses the boundary.
-    """
-    if _hosted_service_account_file is None:
-        raise FileNotFoundError
-    if not _hosted_service_account_file.is_file():
-        if not _hosted_service_account_file.exists():
-            raise FileNotFoundError
-        raise ValueError("invalid service-account file")
-    with _hosted_service_account_file.open("rb") as source:
-        raw = source.read(131073)
-    if len(raw) > 131072:
-        raise ValueError("invalid service-account file")
-
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate service-account field")
-            result[key] = value
-        return result
-
-    info = json.loads(raw, object_pairs_hook=unique_object)
-    if not isinstance(info, dict) or info.get("type") != "service_account":
-        raise ValueError("invalid service-account schema")
-    email = info.get("client_email")
-    key = info.get("private_key")
-    if (
-        not isinstance(email, str)
-        or not email.isascii()
-        or not 3 <= len(email) <= 320
-        or "@" not in email
-        or any(c.isspace() for c in email)
-    ):
-        raise ValueError("invalid service-account schema")
-    if (
-        not isinstance(key, str)
-        or not key.startswith("-----BEGIN PRIVATE KEY-----\n")
-        or not key.rstrip().endswith("-----END PRIVATE KEY-----")
-    ):
-        raise ValueError("invalid service-account schema")
-    if info.get("token_uri") != "https://oauth2.googleapis.com/token":
-        raise ValueError("invalid service-account token destination")
-    if info.get("universe_domain", "googleapis.com") != "googleapis.com":
-        raise ValueError("invalid service-account API destination")
-    # Local PEM parsing only: this creates no Google credential/client, token,
-    # refresh transport or network request.  Required-credential readiness must
-    # reject broken signing data even before a business tool is called.
-    RSASigner.from_string(key)
-    return info
-
-
-def _build_hosted_creds() -> Any:
-    global _hosted_credentials, _hosted_credentials_invalid
-    if _hosted_credentials is not None:
-        return _hosted_credentials
-    if _hosted_service_account_file is None:
-        raise RuntimeError("credentials_missing")
-    try:
-        _validate_hosted_service_account_file()
-        _hosted_credentials = SACredentials.from_service_account_file(
-            str(_hosted_service_account_file), scopes=list(SCOPES_READ)
-        )
-    except FileNotFoundError:
-        raise RuntimeError("credentials_missing") from None
-    except Exception:
-        _hosted_credentials_invalid = True
-        raise RuntimeError("credentials_invalid") from None
-    _hosted_credentials_invalid = False
-    return _hosted_credentials
 
 
 def _current_credentials_fingerprint() -> str:
@@ -227,17 +296,7 @@ def _current_credentials_fingerprint() -> str:
     discarded and built afresh — preventing silent multi-tenant bleed when
     the operator swaps accounts mid-session.
     """
-    if is_hosted_production():
-        if _hosted_service_account_file is None:
-            return "hosted:pending"
-        try:
-            stat = _hosted_service_account_file.stat()
-            version = (
-                f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_size}"
-            )
-        except OSError:
-            version = "missing"
-        return f"hosted:{_hosted_service_account_file}:{version}"
+    _require_legacy()
     parts: list[str] = [
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
         os.getenv("GOOGLE_SEO_SERVICE_ACCOUNT_FILE", ""),
@@ -275,17 +334,25 @@ def _check_fingerprint_or_invalidate() -> None:
             "Discarding cached clients."
         )
         global _searchconsole_service, _webmasters_service, _ga4_data_client, _ga4_admin_client
-        global _hosted_credentials, _hosted_credentials_invalid
         _searchconsole_service = None
         _webmasters_service = None
         _ga4_data_client = None
         _ga4_admin_client = None
-        _hosted_credentials = None
-        _hosted_credentials_invalid = False
         _credentials_fingerprint = fp
 
 
+def _require_legacy() -> None:
+    if is_hosted_production():
+        error = RuntimeError("property_binding_required")
+        try:
+            raise error from None
+        except RuntimeError:
+            error.__context__ = error.__cause__ = None
+            raise
+
+
 def _config_dir() -> Path:
+    _require_legacy()
     p = Path(user_config_dir("google-seo-mcp"))
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -298,6 +365,7 @@ def _scopes() -> list[str]:
 
 
 def _from_adc() -> Any | None:
+    _require_legacy()
     try:
         creds, project = google_auth_default(scopes=_scopes())
         log.info("Using ADC credentials (project=%s)", project)
@@ -353,6 +421,7 @@ def _from_adc() -> Any | None:
 
 
 def _from_service_account() -> Any | None:
+    _require_legacy()
     sa_path = os.getenv("GOOGLE_SEO_SERVICE_ACCOUNT_FILE")
     if not sa_path or not Path(sa_path).exists():
         return None
@@ -361,6 +430,7 @@ def _from_service_account() -> Any | None:
 
 
 def _from_oauth_flow() -> Any | None:
+    _require_legacy()
     client_file = os.getenv("GOOGLE_SEO_OAUTH_CLIENT_FILE")
     if not client_file or not Path(client_file).exists():
         return None
@@ -436,8 +506,7 @@ def _atomic_write_text(target: Path, text: str) -> None:
 
 
 def _build_creds() -> Any:
-    if is_hosted_production():
-        return _build_hosted_creds()
+    _require_legacy()
     creds = _from_adc() or _from_service_account() or _from_oauth_flow()
     if creds is None:
         raise RuntimeError(
@@ -463,49 +532,34 @@ def _build_creds() -> Any:
 
 # ── GSC clients ─────────────────────────────────────────────────────────────
 
-def _hosted_client(factory: Any, *args: Any, **kwargs: Any) -> Any:
-    """Do not surface constructor/credential exception values to callers."""
-    creds = _build_creds()
-    try:
-        return factory(*args, credentials=creds, **kwargs)
-    except Exception:
-        raise RuntimeError("google_client_unavailable") from None
 
 def get_searchconsole():
     """Search Console v1 client (URL Inspection API lives here)."""
+    _require_legacy()
     global _searchconsole_service
-    if _searchconsole_service is not None and not is_hosted_production():
+    if _searchconsole_service is not None:
         return _searchconsole_service
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _searchconsole_service is None:
-            if is_hosted_production():
-                _searchconsole_service = _hosted_client(
-                    build, "searchconsole", "v1", cache_discovery=False, static_discovery=True
-                )
-            else:
-                _searchconsole_service = build(
-                    "searchconsole", "v1", credentials=_build_creds(), cache_discovery=False
-                )
+            _searchconsole_service = build(
+                "searchconsole", "v1", credentials=_build_creds(), cache_discovery=False
+            )
     return _searchconsole_service
 
 
 def get_webmasters():
     """Webmasters v3 client (Search Analytics, sitemaps, sites)."""
+    _require_legacy()
     global _webmasters_service
-    if _webmasters_service is not None and not is_hosted_production():
+    if _webmasters_service is not None:
         return _webmasters_service
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _webmasters_service is None:
-            if is_hosted_production():
-                _webmasters_service = _hosted_client(
-                    build, "webmasters", "v3", cache_discovery=False, static_discovery=True
-                )
-            else:
-                _webmasters_service = build(
-                    "webmasters", "v3", credentials=_build_creds(), cache_discovery=False
-                )
+            _webmasters_service = build(
+                "webmasters", "v3", credentials=_build_creds(), cache_discovery=False
+            )
     return _webmasters_service
 
 
@@ -513,31 +567,27 @@ def get_webmasters():
 
 def get_data_client() -> BetaAnalyticsDataClient:
     """GA4 Data API v1beta client (runReport, runRealtimeReport, etc.)."""
+    _require_legacy()
     global _ga4_data_client
-    if _ga4_data_client is not None and not is_hosted_production():
+    if _ga4_data_client is not None:
         return _ga4_data_client
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _ga4_data_client is None:
-            _ga4_data_client = (
-                _hosted_client(BetaAnalyticsDataClient) if is_hosted_production()
-                else BetaAnalyticsDataClient(credentials=_build_creds())
-            )
+            _ga4_data_client = BetaAnalyticsDataClient(credentials=_build_creds())
     return _ga4_data_client
 
 
 def get_admin_client() -> AnalyticsAdminServiceClient:
     """GA4 Admin API v1beta client (accounts, properties, custom dims)."""
+    _require_legacy()
     global _ga4_admin_client
-    if _ga4_admin_client is not None and not is_hosted_production():
+    if _ga4_admin_client is not None:
         return _ga4_admin_client
     with _auth_lock:
         _check_fingerprint_or_invalidate()
         if _ga4_admin_client is None:
-            _ga4_admin_client = (
-                _hosted_client(AnalyticsAdminServiceClient) if is_hosted_production()
-                else AnalyticsAdminServiceClient(credentials=_build_creds())
-            )
+            _ga4_admin_client = AnalyticsAdminServiceClient(credentials=_build_creds())
     return _ga4_admin_client
 
 
@@ -551,10 +601,10 @@ def current_credential_type() -> str:
     (Service Account credentials are self-issued and don't need re-auth,
     whereas ADC and OAuth flow can re-trigger a real auth handshake).
 
-    Returns one of: 'service_account', 'adc', 'oauth_flow', 'none'.
+    Hosted returns 'dual-user-oauth' or 'none'; legacy preserves its cascade.
     """
     if is_hosted_production():
-        return "service_account" if google_credentials_state() == "available" else "none"
+        return "dual-user-oauth" if google_credentials_state() == "available" else "none"
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and Path(
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
     ).exists():
@@ -586,22 +636,24 @@ def reset_clients(*, drop_oauth_token: bool = True) -> dict:
     surface to the agent.
     """
     global _searchconsole_service, _webmasters_service, _ga4_data_client, _ga4_admin_client
-    global _hosted_credentials, _hosted_credentials_invalid, _credentials_fingerprint
+    global _credentials_fingerprint
+    if is_hosted_production():
+        with _auth_lock:
+            attempts = (
+                (_hosted_registry.retire, _clear_google_caches)
+                if _hosted_registry is not None else (_clear_google_caches,)
+            )
+            _owned_cleanup(*attempts)
+        return {
+            "credential_type": "none", "deleted_oauth_token": False,
+            "message": "Hosted registry retired; explicit reconfiguration required.",
+        }
     with _auth_lock:
         _searchconsole_service = None
         _webmasters_service = None
         _ga4_data_client = None
         _ga4_admin_client = None
-        _hosted_credentials = None
-        _hosted_credentials_invalid = False
         _credentials_fingerprint = None
-
-    if is_hosted_production():
-        return {
-            "credential_type": current_credential_type(),
-            "deleted_oauth_token": False,
-            "message": "In-process clients reset; hosted service-account identity retained.",
-        }
 
     cred_type = current_credential_type()
     deleted_token = False

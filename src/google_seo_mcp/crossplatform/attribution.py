@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from ..auth import get_webmasters, normalize_property
+from ..auth import get_webmasters, normalize_property, is_hosted_production
+from ..gsc.tools import analytics as _gsc_reads
 from ..ga4.data import run_report
 from ..ga4.dates import period as ga_period
 from ..gsc.analytics import query_search_analytics
@@ -35,8 +36,9 @@ def seo_to_revenue_attribution(
     ga_start, ga_end = ga_period(days)
 
     # ── 1) GSC (query, page) ───────────────────────────────
-    gsc_rows = query_search_analytics(
-        get_webmasters(),
+    client = _gsc_reads._read_client(site_url, get_webmasters)
+    gsc_rows = _gsc_reads._run_query(
+        client, query_search_analytics,
         site_url,
         gsc_start,
         gsc_end,
@@ -79,7 +81,7 @@ def seo_to_revenue_attribution(
     for full_url in pages_to_query:
         path = _to_path(full_url)
         rows = run_report(
-            pid,
+            property_id if is_hosted_production() else pid,
             start_date=ga_start,
             end_date=ga_end,
             metrics=["totalRevenue", "conversions", "sessions"],

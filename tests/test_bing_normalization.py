@@ -283,7 +283,7 @@ def test_invalid_mask(mask):
 def test_every_eleven_shape_golden(op, raw_type, payload, selectors, kind, cadence):
     req = request(op, **selectors)
     raw = raw_type(**{**payload, "Unknown": "must disappear"})
-    result = normalize([raw], req, approved_sites={SITE})
+    result = normalize([raw], req)
     assert result.status == "ok" and result.records[0].kind == kind
     assert result.provider_cadence == cadence and result.provider_completeness == "unknown"
     assert (result.source_rows, result.returned_rows, result.dropped_rows) == (1, 1, 0)
@@ -301,34 +301,30 @@ def test_every_eleven_shape_golden(op, raw_type, payload, selectors, kind, caden
         assert output["page_url"] == selectors.get("page_url")
         assert output["selector_query"] == selectors.get("query")
         assert output["query"] == QUERY["Query"]
-    empty = normalize([], req, approved_sites={SITE})
+    empty = normalize([], req)
     assert empty.status == "empty" and empty.provider_cadence == cadence
     assert empty.source_rows == empty.returned_rows == empty.dropped_rows == 0
     assert empty.observed_period is None
 
 
 def test_discovery_exact_approved_verified_and_auth_codes_stripped():
-    req = request("GetUserSites")
-    rows = [
-        RawBingSite(
-            Url=url,
-            IsVerified=verified,
-            AuthenticationCode="SYNTHETIC-CODE",
-            DnsVerificationCode="SYNTHETIC-DNS",
-        )
-        for url, verified in (
-            (SITE, True),
-            (SITE, False),
-            ("https://unapproved.com/", True),
-            (SITE.rstrip("/"), True),
-        )
-    ]
-    assert normalize(rows, req).status == "invalid_request"
-    result = normalize(rows, req, approved_sites={SITE})
-    assert result.source_rows == 4 and result.returned_rows == 1 and result.dropped_rows == 0
-    assert result.records[0].model_dump() == {"url": SITE, "is_verified": True, "kind": "site"}
-    assert "SYNTHETIC" not in result.model_dump_json()
-    assert normalize(rows, req, approved_sites=set()).status == "empty"
+    # Pure normalization does not authorize or apply a static policy.
+    rows = [RawBingSite(Url=url, IsVerified=verified,
+                       AuthenticationCode="discard-code", DnsVerificationCode="discard-dns")
+            for url, verified in ((SITE, True), ("https://other-public.com/", False),
+                                  ("https://new-public.com/", True))]
+    result = normalize(rows, request("GetUserSites"))
+    assert result.status == "ok"
+    assert (result.source_rows, result.returned_rows, result.dropped_rows) == (3, 3, 0)
+    assert [(r.url, r.is_verified) for r in result.records] == [
+        (SITE, True), ("https://other-public.com/", False), ("https://new-public.com/", True)]
+    assert result.provider_completeness == "unknown"
+    assert "discard" not in result.model_dump_json()
+    assert "AuthenticationCode" not in result.model_dump_json()
+    assert "DnsVerificationCode" not in result.model_dump_json()
+    with pytest.raises(TypeError):
+        normalize_bing_rows(result.operation, rows, request("GetUserSites"),
+                            **{"approved_sites": {SITE}})
 
 
 def test_dates_partial_all_invalid_and_filtered_empty():
@@ -434,7 +430,7 @@ def test_synthetic_query_full_golden_snapshot():
 def test_discovery_has_no_implicit_100_site_cap():
     sites = {f"https://site-{n}.com/" for n in range(101)}
     rows = [RawBingSite(Url=site, IsVerified=True) for site in sorted(sites)]
-    result = normalize(rows, request("GetUserSites"), approved_sites=sites)
+    result = normalize(rows, request("GetUserSites"))
     assert result.returned_rows == 101 and not result.local_truncated
 
 
@@ -470,3 +466,54 @@ def test_provider_order_preserved_no_aggregation_and_zero_ctr():
     assert "all_verticals" in result.warnings
     assert result.observed_period.start_date == date(1970, 1, 1)
     assert result.local_truncated
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
+def test_discovery_verification_evidence_requires_strict_boolean(value):
+    with pytest.raises(ValidationError):
+        RawBingSite(Url=SITE, IsVerified=value)
+
+
+@pytest.mark.parametrize("case", ["duplicate", "conflict", "wrong_eligible", "false_eligible",
+    "partial_eligible", "complete_drops", "unchecked_flag", "invalid_url"])
+def test_complete_inventory_snapshot_rejects_inconsistent_authority(case):
+    from google_seo_mcp.bing.models import BingDiscoverySnapshot, BingSiteRecord
+    true = BingSiteRecord(Url=SITE, IsVerified=True)
+    false = BingSiteRecord(Url="https://unverified-public.com/", IsVerified=False)
+    data = dict(credential_generation="synthetic-generation", listed_sites=(true, false),
+                eligible_sites=frozenset({SITE}), complete=True, invalid_rows=0)
+    if case == "duplicate":
+        data["listed_sites"] = (true, true)
+    elif case == "conflict":
+        data["listed_sites"] = (true, BingSiteRecord(Url=SITE, IsVerified=False))
+    elif case == "wrong_eligible":
+        data["eligible_sites"] = frozenset({"https://missing-public.com/"})
+    elif case == "false_eligible":
+        data["eligible_sites"] = frozenset({SITE, false.url})
+    elif case == "partial_eligible":
+        data["complete"] = False
+    elif case == "complete_drops":
+        data["invalid_rows"] = 1
+    elif case == "unchecked_flag":
+        data["listed_sites"] = (true.model_copy(update={"is_verified": "true"}),)
+    else:
+        data["listed_sites"] = (true.model_copy(update={"url": "http://127.0.0.1/"}),)
+    with pytest.raises(ValidationError):
+        BingDiscoverySnapshot(**data)
+
+
+def test_complete_inventory_true_false_empty_and_private_projection():
+    from google_seo_mcp.bing.models import BingDiscoverySnapshot, BingSiteRecord
+    true = BingSiteRecord(Url=SITE, IsVerified=True)
+    false = BingSiteRecord(Url="https://unverified-public.com/", IsVerified=False)
+    complete = BingDiscoverySnapshot(credential_generation="synthetic-generation",
+        listed_sites=(true, false), eligible_sites=frozenset({SITE}), invalid_rows=0, complete=True)
+    assert complete.listed_sites == (true, false) and complete.eligible_sites == frozenset({SITE})
+    assert complete.complete is True and complete.model_dump() == {}
+    empty = BingDiscoverySnapshot(credential_generation="synthetic-generation", listed_sites=(),
+        eligible_sites=frozenset(), invalid_rows=0, complete=True)
+    assert empty.complete is True and empty.listed_sites == ()
+    assert empty.eligible_sites == frozenset()
+    partial = BingDiscoverySnapshot(credential_generation="synthetic-generation",
+        listed_sites=(true, false), eligible_sites=frozenset(), invalid_rows=1, complete=False)
+    assert partial.complete is False and partial.eligible_sites == frozenset()

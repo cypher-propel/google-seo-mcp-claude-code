@@ -1,7 +1,8 @@
 """Traffic health check — detects tracking gaps between GSC and GA4."""
 from __future__ import annotations
 
-from ..auth import get_webmasters, normalize_property
+from ..auth import get_webmasters, normalize_property, is_hosted_production
+from ..gsc.tools import analytics as _gsc_reads
 from ..ga4.data import run_report
 from ..ga4.dates import period as ga_period
 from ..gsc.analytics import aggregate_totals, query_search_analytics
@@ -42,14 +43,15 @@ def traffic_health_check(
     aligned_end = date.fromisoformat(gsc_end)
     ga_start, ga_end = ga_period(days, end=aligned_end)
 
-    gsc_rows = query_search_analytics(
-        get_webmasters(), site_url, gsc_start, gsc_end, dimensions=[]
+    client = _gsc_reads._read_client(site_url, get_webmasters)
+    gsc_rows = _gsc_reads._run_query(
+        client, query_search_analytics, site_url, gsc_start, gsc_end, dimensions=[]
     )
     gsc_totals = aggregate_totals(gsc_rows)
     gsc_clicks = gsc_totals["clicks"]
 
     ga_rows = run_report(
-        pid,
+        property_id if is_hosted_production() else pid,
         start_date=ga_start,
         end_date=ga_end,
         metrics=["sessions"],

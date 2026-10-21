@@ -10,6 +10,8 @@ from ..ga4.dates import period as ga_period
 from ..guardrails import with_meta
 
 
+from ..google_accounts.routing import _property_id
+
 def multi_property_comparison(
     property_ids: list[int | str],
     metric: str = "sessions",
@@ -43,12 +45,17 @@ def multi_property_comparison(
         raise ValueError(f"max 50 properties per call, got {len(property_ids)}")
 
     start, end = ga_period(days)
-    norm_ids = [normalize_property(p) for p in property_ids]
+    norm_ids = list(property_ids) if hosted else [normalize_property(p) for p in property_ids]
 
     def _fetch(pid: str) -> dict[str, Any]:
+        raw_property = pid
+        if hosted:
+            pid = None
         try:
+            if hosted:
+                pid = _property_id(raw_property)
             result = run_report(
-                pid,
+                raw_property if hosted else pid,
                 start_date=start,
                 end_date=end,
                 metrics=[metric],
@@ -88,7 +95,9 @@ def multi_property_comparison(
                     error = e.args[0]
             else:
                 error = str(e)[:200]
-            return {"property": pid, "total": None, "breakdown": None, "error": error}
+            if hosted and getattr(e, 'code', None) == 'agency_discovery_incomplete':
+                error = 'agency_discovery_incomplete'
+            return {"property": None if hosted else pid, "total": None, "breakdown": None, "error": error}
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
         results = list(pool.map(_fetch, norm_ids))

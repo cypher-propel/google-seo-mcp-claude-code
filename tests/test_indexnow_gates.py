@@ -45,9 +45,13 @@ def capture_production():
         ProductionRuntimeConfig(
             profile="production",
             transport="streamable-http",
-            google_auth_mode="service-account",
-            service_account_file=Path("absent-sa.json"),
-            consumer_keys_file=Path("unused-registry.json"),
+            google_auth_mode="dual-user-oauth",
+            google_oauth_client_file=Path("/synthetic-absent/client.json"),
+            google_oauth_propel_dms_file=Path("/synthetic-absent/propel-dms.json"),
+            google_oauth_addourteam99_file=Path("/synthetic-absent/addourteam99.json"),
+            google_approved_client_id="synthetic.apps.googleusercontent.com",
+            google_approved_project_id="synthetic-project",
+            consumer_keys_file=Path("/synthetic-absent/registry.json"),
         )
     )
 

@@ -42,12 +42,10 @@ profile = PROFILE
 config = load_runtime_config(['--transport', 'streamable-http'] if profile == 'hosted' else [], {})
 root = Path.cwd()
 root.chmod(0o700)
-keyfile, sitesfile = root/'synthetic-key.json', root/'synthetic-sites.json'
+keyfile = root/'synthetic-key.json'
 keyfile.write_text(json.dumps({'version':1, 'api_key':KEY}))
-sitesfile.write_text(json.dumps({'version':1, 'sites':[SITE]}))
 keyfile.chmod(0o600)
-sitesfile.chmod(0o600)
-config = config.model_copy(update={'bing_credentials_file':keyfile, 'bing_sites_file':sitesfile})
+config = config.model_copy(update={'bing_credentials_file':keyfile})
 instance = server.create_server(config)
 # Capture the RAW factory inputs, before hosted callHandlers/filter sanitization.
 raw = []
@@ -110,6 +108,16 @@ async def call(name='bing_query_stats', arguments=None):
     assert sent[0]['status'] == 200
     return output[0]
 
+def is_discovery(request):
+    return request.url.path.endswith('/GetUserSites')
+
+def inventory_response():
+    return httpx.Response(200, json={'d':[{'Url':SITE, 'IsVerified':True}]})
+
+def sends_by_stage(seen):
+    return {'discovery':sum(is_discovery(request) for request in seen),
+            'business':sum(not is_discovery(request) for request in seen)}
+
 def business(result):
     assert result['isError'] is False
     return json.loads(result['content'][0]['text'])
@@ -143,7 +151,7 @@ def probe(tmp_path, profile, code):
     if "GOOGLE_SEO_TEST_PYTHON" not in os.environ:
         environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
     result = subprocess.run(
-        [interpreter, "-c", BOOT.replace("PROFILE", repr(profile)) + code],
+        [interpreter, "-W", "error", "-c", BOOT.replace("PROFILE", repr(profile)) + code],
         cwd=tmp_path, env=environment, capture_output=True, text=True,
         timeout=40, check=False,
     )
@@ -190,6 +198,7 @@ for location in locations:
     def upstream(request):
         seen.append(request)
         private_log(str(request.url))
+        if is_discovery(request): return inventory_response()
         return httpx.Response(200, json=payload)
     tools.configure_bing_tools(BingReadClient(
         transport=httpx.MockTransport(upstream), max_retries=0))
@@ -199,7 +208,7 @@ for location in locations:
     assert data['data']['error']['code'] == 'credential_reflection'
     assert not data['data']['records']
     safe(result)
-assert len(seen) == len(locations)
+assert sends_by_stage(seen) == {'discovery':len(locations), 'business':len(locations)}
 finish(len(locations))
 '''.replace("VARIANT", str(variant_index)))
     assert receipt["cases"] == 6
@@ -216,6 +225,7 @@ seen = []
 def upstream(request):
     seen.append(request)
     private_log(str(request.url))
+    if is_discovery(request): return inventory_response()
     raise getattr(httpx, EXCEPTION)('private URL '+str(request.url), request=request)
 tools.configure_bing_tools(BingReadClient(transport=httpx.MockTransport(upstream), max_retries=0))
 result = asyncio.run(call())
@@ -223,7 +233,7 @@ data = business(result)
 assert data['data']['status'] == 'provider_error'
 expected = 'timeout' if EXCEPTION == 'ReadTimeout' else 'transport_error'
 assert data['data']['error']['code'] == expected
-assert len(seen) == 1
+assert sends_by_stage(seen) == {'discovery':1, 'business':1}
 safe(result)
 finish(1)
 '''.replace("EXCEPTION", repr(exception)))
@@ -232,29 +242,40 @@ finish(1)
 @pytest.mark.parametrize("profile", ["legacy", "hosted"])
 @pytest.mark.parametrize("stage", [
     "constructor", "loader", "entry", "request_hook", "response_hook",
-    "stream", "stream_close", "transport_close", "sleep", "jitter",
+    "stream", "stream_close", "transport_close", "generation", "rate",
 ])
 def test_owned_lifecycle_logs_suppressed_before_raw_record_factory(tmp_path, profile, stage):
     probe(tmp_path, profile, r'''
-from google_seo_mcp.bing.client import BingReadClient
+from google_seo_mcp.bing import client as boundary
+BingReadClient = boundary.BingReadClient
 stage = STAGE
 hits = []
+seen = []
+entered = []
 def hit(point):
     if stage == point:
         hits.append(point)
         private_log(KEY)
-        raise RuntimeError('foreign '+KEY)
+        try:
+            raise ValueError('foreign cause '+quote(KEY, safe=''))
+        except ValueError as cause:
+            raise RuntimeError('foreign '+KEY) from cause
 class Loader(auth.BingCredentialLoader):
     def load(self):
         hit('loader')
         return super().load()
+    def require_generation(self, expected):
+        assert entered
+        hit('generation')
+        return super().require_generation(expected)
 class Stream(httpx.SyncByteStream):
     def __iter__(self):
         hit('stream')
-        yield b'{"d":[]}'
+        yield json.dumps({'d':[{'Url':SITE, 'IsVerified':True}]}).encode()
     def close(self): hit('stream_close')
 class Transport(httpx.MockTransport):
     def __enter__(self):
+        entered.append(True)
         hit('entry')
         return super().__enter__()
     def __exit__(self, *args):
@@ -269,20 +290,58 @@ class Client(original):
         hooks = {'request':[request_hook], 'response':[response_hook]}
         super().__init__(event_hooks=hooks, **kwargs)
 httpx.Client = Client
-retry = stage in ('sleep', 'jitter')
-transport = Transport(lambda req: httpx.Response(503 if retry else 200, stream=Stream()))
-def sleep(seconds): hit('sleep')
-def jitter():
-    hit('jitter')
-    return 0
+def upstream(request):
+    seen.append(request)
+    assert is_discovery(request)
+    return httpx.Response(200, stream=Stream())
+transport = Transport(upstream)
+if stage == 'rate':
+    original_charge = boundary._GLOBAL.charge
+    def charge(): hit('rate')
+    boundary._GLOBAL.charge = charge
 tools.configure_bing_tools(BingReadClient(Loader(), transport=transport,
-    max_retries=int(retry), sleep=sleep, jitter=jitter))
+    max_retries=0))
 result = asyncio.run(call())
 assert business(result)['data']['status'] == 'provider_error'
+assert business(result)['data']['error']['code'] == 'transport_error'
 assert hits == [stage]
+assert sends_by_stage(seen) == {
+    'discovery':int(stage in ('response_hook', 'stream', 'stream_close', 'transport_close')),
+    'business':0}
 safe(result)
 # The failure's own log calls never even constructed a raw LogRecord.
 assert all('fixture.private' != args[0] for args, kwargs in raw)
+if stage == 'generation':
+    # Independently prove real custody revocation after transport entry, not
+    # just containment of a foreign exception at that observation boundary.
+    revoked_entries = []
+    class RevokingTransport(httpx.MockTransport):
+        def __enter__(self):
+            result = super().__enter__()
+            revoked_entries.append(True)
+            auth.configure_bing_auth(config)
+            return result
+    tools.configure_bing_tools(BingReadClient(auth.BingCredentialLoader(),
+        transport=RevokingTransport(upstream), max_retries=0))
+    revoked = asyncio.run(call())
+    assert revoked_entries == [True]
+    assert business(revoked)['data']['error']['code'] == 'credentials_invalid'
+    assert sends_by_stage(seen) == {'discovery':0, 'business':0}
+    assert hits == [stage]
+    safe(revoked)
+if stage == 'rate':
+    # A full real rolling admission budget also refuses before construction,
+    # without retry, sleeping, or spending another transport attempt.
+    from unittest.mock import patch
+    boundary._GLOBAL.charge = original_charge
+    boundary._GLOBAL.attempts.extend([boundary.time.monotonic()] * 12)
+    with patch.object(httpx, 'Client', side_effect=AssertionError('rate HTTP')) as client:
+        limited = asyncio.run(call())
+        client.assert_not_called()
+    assert business(limited)['data']['error']['code'] == 'rate_limited'
+    assert sends_by_stage(seen) == {'discovery':0, 'business':0}
+    assert hits == [stage]
+    safe(limited)
 finish(1)
 '''.replace("STAGE", repr(stage)))
 
@@ -336,8 +395,11 @@ cases = [('synthetic%2Bdecoded%2Fkey', 'synthetic+decoded/key'),
 for key, reflected in cases:
     keyfile.write_text(json.dumps({'version':1, 'api_key':key}))
     auth.configure_bing_auth(config)
+    seen = []
     def upstream(request):
+        seen.append(request)
         assert request.url.params['apikey'] == key
+        if is_discovery(request): return inventory_response()
         return httpx.Response(200, json={'d':[{'Unknown':{reflected:['ignored']}}]})
     tools.configure_bing_tools(BingReadClient(
         transport=httpx.MockTransport(upstream), max_retries=0))
@@ -345,6 +407,7 @@ for key, reflected in cases:
     assert business(result)['data']['error']['code'] == 'credential_reflection'
     serialized = json.dumps(result, ensure_ascii=False)
     assert key not in serialized and reflected not in serialized
+    assert sends_by_stage(seen) == {'discovery':1, 'business':1}
 finish(len(cases))
 ''')
 
@@ -391,8 +454,11 @@ def test_private_context_does_not_silence_other_threads_or_post_call_logs(tmp_pa
 from concurrent.futures import ThreadPoolExecutor
 from google_seo_mcp.bing.client import BingReadClient
 entered, release = threading.Event(), threading.Event()
+seen = []
 def upstream(request):
+    seen.append(request)
     private_log(str(request.url))
+    if is_discovery(request): return inventory_response()
     entered.set()
     assert release.wait(5)
     return httpx.Response(200, json={'d':[]})
@@ -409,6 +475,7 @@ with ThreadPoolExecutor(max_workers=1) as pool:
     finally:
         release.set()
     assert business(future.result(timeout=5))['data']['status'] == 'empty'
+assert sends_by_stage(seen) == {'discovery':1, 'business':1}
 logger.error('ordinary_after_control')
 controls = [args[4] for args, kwargs in raw if args[0] == 'ordinary.control']
 assert controls == ['ordinary_parallel_control', 'ordinary_after_control']
@@ -436,34 +503,62 @@ if ENCODING == 'mixed':
     encoded = 'synthetic-' + quote('denial-é', safe='') + '-%39%33%37%32'
 site = 'https://bing.com/' + encoded
 loader = auth.BingCredentialLoader()
-loads, authorized = [], []
-load, authorize = loader.load, loader.authorize_site
+loads, generations = [], []
+load, require_generation = loader.load, loader.require_generation
 def tracked_load():
     loads.append(True)
     return load()
-def tracked_authorize(value):
-    authorized.append(value)
-    return authorize(value)
-loader.load, loader.authorize_site = tracked_load, tracked_authorize
+def tracked_generation(value):
+    generations.append(value)
+    return require_generation(value)
+loader.load, loader.require_generation = tracked_load, tracked_generation
 tools.configure_bing_tools(boundary.BingReadClient(loader))
 with patch.object(httpx, 'Client', side_effect=AssertionError('denied HTTP')) as http:
     result = asyncio.run(call(arguments={'site_url':site,
         'start_date':'2025-03-04', 'end_date':'2025-03-05'}))
     http.assert_not_called()
 payload = business(result)
-assert payload['data']['status'] == 'denied'
-assert payload['data']['error']['code'] == 'site_denied'
+assert payload['data']['status'] == 'provider_error'
+assert payload['data']['error']['code'] == 'credential_reflection'
 assert payload['data']['site_url'] == ''
 assert payload['_meta']['site_url'] == ''
 assert payload['data']['requested_period'] is None
 assert payload['_meta']['requested_period'] is None
 assert 'period' not in payload['_meta']
-assert len(loads) == 2 and authorized == [site]  # Existing authorize_site also loads.
+assert loads == [True] and generations == []  # Refuse before discovery/admission.
 text = json.dumps([result, raw, private_delivered], ensure_ascii=False, default=str)
 for marker in (KEY, encoded, site, '2025-03-04', '2025-03-05'):
     assert marker not in text
 safe(result)
-finish(1)
+# The former static-policy denial is now proven against actual inventory:
+# neither an unlisted property nor a strictly false row admits business I/O.
+for listed in (False, True):
+    seen = []
+    denied_site = 'https://bing.com/SYNTHETIC_DENIED_PROPERTY/'
+    def upstream(request):
+        seen.append(request)
+        assert is_discovery(request), 'denied property reached business transport'
+        rows = [{'Url':SITE, 'IsVerified':True}]
+        if listed: rows.append({'Url':denied_site, 'IsVerified':False})
+        return httpx.Response(200, json={'d':rows})
+    tools.configure_bing_tools(boundary.BingReadClient(
+        transport=httpx.MockTransport(upstream), max_retries=0))
+    result = asyncio.run(call(arguments={'site_url':denied_site,
+        'start_date':'2025-03-04', 'end_date':'2025-03-05'}))
+    payload = business(result)
+    assert payload['data']['status'] == 'denied'
+    assert payload['data']['error']['code'] == 'site_denied'
+    for part in (payload['data'], payload['_meta']):
+        assert part['site_url'] == ''
+        assert part['requested_period'] is None and part['observed_period'] is None
+    assert 'period' not in payload['_meta']
+    assert payload['data']['records'] == []
+    assert sends_by_stage(seen) == {'discovery':1, 'business':0}
+    text = json.dumps([result, raw, private_delivered], ensure_ascii=False, default=str)
+    for marker in (denied_site, '2025-03-04', '2025-03-05'):
+        assert marker not in text
+    safe(result)
+finish(3)
 '''.replace("ENCODING", repr(encoding)))
 
 
@@ -504,6 +599,7 @@ if stage == 'busy':
 seen = []
 def upstream(request):
     seen.append(request)
+    if is_discovery(request): return inventory_response()
     payload = {'ErrorCode':'synthetic'} if stage == 'provider' else (
         {'d':None} if stage == 'schema' else {'d':[{'Clicks':True}]})
     return httpx.Response(200, json=payload)
@@ -529,7 +625,8 @@ else:
 text = json.dumps([result, raw, private_delivered], ensure_ascii=False, default=str)
 for marker in (site, query, '2025-03-04', '2025-03-05'):
     assert marker not in text
-assert len(seen) == (1 if stage in ('provider', 'schema', 'rows') else 0)
+expected_sends = int(stage in ('provider', 'schema', 'rows'))
+assert sends_by_stage(seen) == {'discovery':expected_sends, 'business':expected_sends}
 safe(result)
 finish(1)
 '''.replace("STAGE", repr(stage)))

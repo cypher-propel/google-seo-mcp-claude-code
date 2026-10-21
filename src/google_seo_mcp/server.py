@@ -8,6 +8,7 @@ Tools are namespaced with prefixes to avoid collisions and aid LLM discovery:
 """
 from __future__ import annotations
 
+from google_seo_mcp.google_accounts.models import GoogleAccountError
 import functools
 import inspect
 import logging
@@ -140,18 +141,92 @@ def _restore_legacy_logging() -> None:
 
 
 def _safe_tool_error(exc: Exception) -> str:
+    if type(exc) is GoogleAccountError:
+        typed_args = exc.args
+        if (
+            type(typed_args) is tuple
+            and len(typed_args) == 1
+            and type(typed_args[0]) is str
+            and typed_args[0] == "agency_discovery_incomplete"
+        ):
+            return "agency_discovery_incomplete"
     if isinstance(exc, ToolPolicyError):
         return "tool_not_allowed"
     if isinstance(exc, ValidationError):
         return "invalid_tool_arguments"
     if (type(exc) is RuntimeError and len(exc.args) == 1
-            and type(exc.args[0]) is str and exc.args[0] in (
+            and type(exc.args[0]) is str and exc.args[0] in ("agency_discovery_incomplete", 
         "credentials_missing", "credentials_invalid", "vendor_unavailable",
         "google_client_unavailable", "provider_unavailable",
         "provider_not_configured", "invalid_request", "provider_error",
     )):
         return exc.args[0]
     return "provider_unavailable"
+
+
+def _protect_hosted_result(result, tool_name):
+    """Scan decoded final leaves against independently loaded provider sets.
+
+    A failed load refuses only that provider's results. Every successfully
+    loaded set participates in every scan, including retained Google tokens.
+    No serialized JSON escaping is allowed between conversion and inspection.
+    Ordinary legacy stdio remains outside this hosted-only boundary.
+    """
+    if not auth_module.is_hosted_production():
+        return result
+    from pydantic_core import to_jsonable_python
+    from types import SimpleNamespace
+    from .google_accounts.clients import _private
+    from . import serp
+
+    def material(*values):
+        return SimpleNamespace(client_secret=values[0], refresh_token=values[1],
+                               token=values[2])
+
+    def google_set():
+        return auth_module.get_google_account_registry().clients.scan_credentials()
+
+    def bing_set():
+        return (material(bing_auth.BingCredentialLoader().load().api_key, None, None),)
+
+    def serp_set():
+        # Reuse the provider's existing admission without changing its semantics.
+        serp._auth_header()
+        return (material(os.getenv('DATAFORSEO_LOGIN'), os.getenv('DATAFORSEO_PASSWORD'),
+                         f"{os.getenv('DATAFORSEO_LOGIN')}:{os.getenv('DATAFORSEO_PASSWORD')}"),)
+
+    provider = ('bing' if tool_name in _BING_TOOL_NAMES else
+                'serp' if tool_name in {'serp_check', 'serp_aio_monitor',
+                    'serp_paa_extractor', 'serp_competitor_intersect'} else
+                'google' if tool_name in ProductionToolPolicy().names else None)
+    if provider is None:
+        raise RuntimeError('provider_unavailable')
+    sets = {}
+    for name, loader in (('google', google_set), ('bing', bing_set), ('serp', serp_set)):
+        try:
+            sets[name] = tuple(loader())
+        except Exception:
+            # Loading failures must not be confused with scanner detections.
+            continue
+    if provider not in sets:
+        raise RuntimeError('provider_unavailable')
+    decoded = to_jsonable_python(result)
+
+    def scan(value):
+        if isinstance(value, str):
+            for credentials in sets.values():
+                for credential in credentials:
+                    _private(value, credential)
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                scan(key)
+                scan(child)
+        elif isinstance(value, list):
+            for child in value:
+                scan(child)
+
+    scan(decoded)
+    return result
 
 
 class HostedTool(Tool):
@@ -163,7 +238,13 @@ class HostedTool(Tool):
                 self.fn, self.is_async, arguments,
                 {self.context_kwarg: context} if self.context_kwarg is not None else None,
             )
-            return self.fn_metadata.convert_result(result) if convert_result else result
+            # SDK unstructured conversion embeds JSON inside TextContent.text.
+            # Inspect the source container before that lossy escaping as well as
+            # the final converted container immediately before emission.
+            if convert_result:
+                _protect_hosted_result(result, self.name)
+                result = self.fn_metadata.convert_result(result)
+            return _protect_hosted_result(result, self.name)
         except Exception as exc:
             raise ToolError(_safe_tool_error(exc)) from None
 
@@ -223,12 +304,13 @@ class PolicyToolManager(ToolManager):
             if tool is None:
                 raise ToolPolicyError("tool_not_allowed")
             result = await tool.run(arguments, context=context, convert_result=convert_result)
+            result = _protect_hosted_result(result, name)
             outcome = "success"
             return result
         except Exception as exc:
             outcome = "denied" if isinstance(exc, ToolPolicyError) else "error"
             # HostedTool already sanitized SDK validation/provider failures.
-            code = str(exc) if type(exc) is ToolError and str(exc) in (
+            code = str(exc) if type(exc) is ToolError and str(exc) in ("agency_discovery_incomplete", 
                 "credentials_missing", "credentials_invalid", "vendor_unavailable",
                 "google_client_unavailable", "provider_unavailable", "invalid_tool_arguments",
                 "tool_not_allowed",

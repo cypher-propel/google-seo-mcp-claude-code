@@ -38,10 +38,17 @@ def test_cli_transport_host_port_profile_override_environment():
 
 def test_http_defaults_service_account_with_exact_local_and_public_authorities():
     config = load_runtime_config([], hosted())
-    assert config.profile == "production" and config.google_auth_mode == "service-account"
+    assert config.profile == "production" and config.google_auth_mode == "dual-user-oauth"
     assert config.host == "0.0.0.0" and config.port == 8000
     assert config.consumer_keys_file == Path("/run/secrets/consumer-keys.json")
-    assert config.service_account_file == Path("/run/secrets/google-seo-service-account.json")
+    assert config.service_account_file is None
+    assert config.google_oauth_client_file == Path("/run/secrets/google-seo-oauth-client.json")
+    assert config.google_oauth_propel_dms_file == Path(
+        "/run/secrets/google-seo-oauth-propel-dms.json"
+    )
+    assert config.google_oauth_addourteam99_file == Path(
+        "/run/secrets/google-seo-oauth-addourteam99.json"
+    )
     assert config.accepted_hosts == (
         "google-seo.mcp.propel.marketing", "localhost:8000", "127.0.0.1:8000", "[::1]:8000"
     )
@@ -59,13 +66,13 @@ def test_operator_exact_hosts_origins_and_custom_paths():
         ),
         GOOGLE_SEO_ACCEPTED_ORIGINS="https://example.com:9443,http://localhost:8000",
         GOOGLE_SEO_CONSUMER_KEYS_FILE="/protected/registry.json",
-        GOOGLE_SEO_SERVICE_ACCOUNT_FILE="/protected/absent.json",
+        GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE="/protected/absent.json",
         GOOGLE_SEO_REQUIRE_GOOGLE_CREDENTIALS="yes",
     ))
     assert config.accepted_hosts == ("example.com:9443", "192.0.2.10:3006", "[2001:db8::1]:3006")
     assert config.accepted_origins == ("https://example.com:9443", "http://localhost:8000")
     assert config.require_google_credentials
-    assert config.service_account_file == Path("/protected/absent.json")
+    assert config.google_oauth_propel_dms_file == Path("/protected/absent.json")
     assert "protected" not in repr(config)
 
 
@@ -139,7 +146,7 @@ def test_cli_errors_never_echo_raw_values(argv, capsys):
 
 def test_model_is_frozen_extra_forbidden_and_paths_hidden():
     config = load_runtime_config(
-        [], hosted(GOOGLE_SEO_SERVICE_ACCOUNT_FILE="/private-sentinel/key.json")
+        [], hosted(GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE="/private-sentinel/key.json")
     )
     assert "private-sentinel" not in repr(config)
     with pytest.raises(ValidationError):
@@ -198,11 +205,11 @@ def test_local_release_revision_fallback_is_explicit(monkeypatch, revision):
 def test_bing_exact_defaults_preserve_legacy_and_hosted_configuration(environment):
     config = load_runtime_config([], environment)
     assert config.bing_credentials_file == Path("/run/secrets/bing-webmaster.json")
-    assert config.bing_sites_file == Path("/run/secrets/bing-sites.json")
+    assert "bing_sites_file" not in type(config).model_fields
     assert config.require_bing_credentials is False
     direct = ProductionRuntimeConfig()
     assert direct.bing_credentials_file == config.bing_credentials_file
-    assert direct.bing_sites_file == config.bing_sites_file
+    assert "bing_sites_file" not in type(direct).model_fields
     assert direct.require_bing_credentials is False
 
 
@@ -212,9 +219,12 @@ def test_bing_model_has_exactly_three_additive_fields():
         "accepted_origins", "consumer_keys_file", "service_account_file", "google_auth_mode",
         "require_google_credentials", "allow_indexnow", "allow_local_files",
         "allow_private_fetch", "allow_destructive", "debug",
+        "google_oauth_client_file", "google_oauth_propel_dms_file",
+        "google_oauth_addourteam99_file", "google_approved_client_id",
+        "google_approved_project_id",
     }
     assert set(ProductionRuntimeConfig.model_fields) == original | {
-        "bing_credentials_file", "bing_sites_file", "require_bing_credentials",
+        "bing_credentials_file", "require_bing_credentials",
     }
 
 
@@ -222,7 +232,7 @@ def test_bing_model_has_exactly_three_additive_fields():
 def test_bing_strict_path_boolean_repr_and_no_file_or_network_io(required):
     environment = hosted(
         GOOGLE_SEO_BING_CREDENTIALS_FILE="/synthetic-private-sentinel/key.json",
-        GOOGLE_SEO_BING_SITES_FILE="/synthetic-private-sentinel/sites.json",
+        GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE="/synthetic-private-sentinel/sites.json",
         GOOGLE_SEO_REQUIRE_BING_CREDENTIALS=str(required),
     )
     with (
@@ -236,16 +246,18 @@ def test_bing_strict_path_boolean_repr_and_no_file_or_network_io(required):
         config = load_runtime_config([], environment)
         direct = ProductionRuntimeConfig(
             bing_credentials_file=Path("/synthetic-private-sentinel/key.json"),
-            bing_sites_file="/synthetic-private-sentinel/sites.json",
+            google_oauth_addourteam99_file="/synthetic-private-sentinel/sites.json",
             require_bing_credentials=required,
         )
     for result in (config, direct):
         assert result.bing_credentials_file == Path("/synthetic-private-sentinel/key.json")
-        assert result.bing_sites_file == Path("/synthetic-private-sentinel/sites.json")
+        assert result.google_oauth_addourteam99_file == Path(
+            "/synthetic-private-sentinel/sites.json"
+        )
         assert result.require_bing_credentials is required
         assert "synthetic-private-sentinel" not in repr(result)
         assert "synthetic-private-sentinel" not in str(result)
-    assert config.google_auth_mode == "service-account"
+    assert config.google_auth_mode == "dual-user-oauth"
     assert config.require_google_credentials is False
 
 
@@ -262,6 +274,11 @@ def test_bing_strict_path_boolean_repr_and_no_file_or_network_io(required):
     None, True, 1, b"/private-sentinel/x", [], {},
 ])
 def test_bing_paths_are_strict_absolute_and_errors_hide_values(field, variable, value, capsys):
+    # Preserve historical IDs; retired policy paths now exercise OAuth custody.
+    if field == "bing_sites_file":
+        with pytest.raises(ValidationError):
+            ProductionRuntimeConfig(**{field: value})
+        field, variable = "google_oauth_addourteam99_file", "GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE"
     with pytest.raises(ValidationError) as direct:
         ProductionRuntimeConfig(**{field: value})
     assert "private-sentinel" not in str(direct.value)
@@ -311,11 +328,11 @@ def test_bing_configuration_is_frozen_path_only_without_key_or_home_fallback():
         "GOOGLE_SEO_BING_API_KEY": "synthetic-private-sentinel",
     })
     assert config.bing_credentials_file == Path("/run/secrets/bing-webmaster.json")
-    assert config.bing_sites_file == Path("/run/secrets/bing-sites.json")
+    assert "bing_sites_file" not in type(config).model_fields
     assert "synthetic-private-sentinel" not in repr(config)
     for field, value in (
         ("bing_credentials_file", Path("/synthetic/key.json")),
-        ("bing_sites_file", Path("/synthetic/sites.json")),
+        ("google_oauth_addourteam99_file", Path("/synthetic/sites.json")),
         ("require_bing_credentials", True),
     ):
         with pytest.raises(ValidationError):
@@ -323,3 +340,76 @@ def test_bing_configuration_is_frozen_path_only_without_key_or_home_fallback():
     for field in ("bing_api_key", "bing_base_url", "bing_auth_mode"):
         with pytest.raises(ValidationError):
             ProductionRuntimeConfig(**{field: "synthetic-private-sentinel"})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"GOOGLE_SEO_AUTH_MODE": "service-account"},
+        {"GOOGLE_SEO_SERVICE_ACCOUNT_FILE": "/synthetic/key.json"},
+        {
+            "GOOGLE_SEO_AUTH_MODE": "dual-user-oauth",
+            "GOOGLE_SEO_SERVICE_ACCOUNT_FILE": "/synthetic/key.json",
+        },
+        {"GOOGLE_SEO_APPROVED_CLIENT_ID": "synthetic.apps.googleusercontent.com"},
+        {"GOOGLE_SEO_APPROVED_PROJECT_ID": "synthetic-project"},
+        {
+            "GOOGLE_SEO_APPROVED_CLIENT_ID": "invalid",
+            "GOOGLE_SEO_APPROVED_PROJECT_ID": "synthetic-project",
+        },
+        {
+            "GOOGLE_SEO_OAUTH_CLIENT_FILE": "/same.json",
+            "GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE": "/same.json",
+        },
+        {
+            "GOOGLE_SEO_OAUTH_PROPEL_DMS_FILE": "/same.json",
+            "GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE": "/same.json",
+        },
+        {
+            "GOOGLE_SEO_OAUTH_CLIENT_FILE": "/same.json",
+            "GOOGLE_SEO_OAUTH_ADDOURTEAM99_FILE": "/same.json",
+        },
+    ],
+)
+def test_dual_oauth_refuses_sa_mixed_incomplete_binding_and_aliased_slots(changes, capsys):
+    forbidden = Mock(side_effect=AssertionError("configuration performed I/O"))
+    with (
+        patch.object(Path, "open", forbidden),
+        patch("os.open", forbidden),
+        patch("socket.getaddrinfo", forbidden),
+        pytest.raises(RuntimeConfigurationError, match="^invalid runtime configuration$"),
+    ):
+        load_runtime_config([], hosted(**changes))
+    forbidden.assert_not_called()
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["google_oauth_client_file", "google_oauth_propel_dms_file", "google_oauth_addourteam99_file"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "relative.json",
+        "/",
+        "/synthetic/../key.json",
+        "/synthetic//key.json",
+        "/synthetic/key\n.json",
+        None,
+        True,
+    ],
+)
+def test_each_oauth_slot_keeps_strict_path_validation(field, value):
+    with pytest.raises(ValidationError):
+        ProductionRuntimeConfig(**{field: value})
+
+
+def test_retired_bing_policy_is_not_a_config_field_or_authority():
+    config = load_runtime_config(
+        [], hosted(GOOGLE_SEO_BING_SITES_FILE="relative-invalid-retired-policy")
+    )
+    assert "bing_sites_file" not in config.model_dump()
+    with pytest.raises(ValidationError):
+        ProductionRuntimeConfig(bing_sites_file="/synthetic/retired-policy.json")

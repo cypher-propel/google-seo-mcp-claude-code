@@ -19,8 +19,10 @@ KEY = "  SYNTHETIC-only+a%2Fb&quoted\"unicode-é  "
 
 @pytest.fixture(autouse=True)
 def deny_network_and_reset(monkeypatch):
+    attempted = []
     def forbidden(*args, **kwargs):
-        pytest.fail("unexpected network/client access")
+        attempted.append(True)
+        raise RuntimeError("unexpected_network_or_client")
 
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
     monkeypatch.setattr(socket.socket, "connect", forbidden)
@@ -31,6 +33,8 @@ def deny_network_and_reset(monkeypatch):
 
     monkeypatch.setattr(httpx, "Client", forbidden)
     monkeypatch.setattr(httpx, "AsyncClient", forbidden)
+    yield
+    assert attempted == []
 
 
 @pytest.fixture
@@ -71,8 +75,13 @@ def test_missing_file_precedes_dns(documents):
 @pytest.mark.parametrize("missing", ["bing_credentials_file", "bing_sites_file"])
 def test_either_missing_is_pending(documents, missing):
     getattr(documents, missing).unlink()
-    assert_failure(configured(documents), "credentials_missing")
-    assert auth.bing_credentials_state() == "pending"
+    loader = configured(documents)
+    if missing == "bing_credentials_file":
+        assert_failure(loader, "credentials_missing")
+        assert auth.bing_credentials_state() == "pending"
+    else:
+        assert loader.load().api_key.get_secret_value() == KEY
+        assert auth.bing_credentials_state() == "available"
 
 
 @pytest.mark.parametrize("missing", ["bing_credentials_file", "bing_sites_file"])
@@ -80,9 +89,12 @@ def test_present_malformed_wins_over_missing(documents, missing):
     getattr(documents, missing).unlink()
     other = (documents.bing_sites_file if missing == "bing_credentials_file"
              else documents.bing_credentials_file)
-    other.write_text('{"api_key":"SYNTHETIC-secret-unclosed', encoding="utf-8")
-    assert_failure(configured(documents))
-    assert auth.bing_credentials_state() == "invalid"
+    other.write_bytes(b"{")
+    loader = configured(documents)
+    code = "credentials_missing" if missing == "bing_credentials_file" else "credentials_invalid"
+    assert_failure(loader, code)
+    expected = "pending" if code == "credentials_missing" else "invalid"
+    assert auth.bing_credentials_state() == expected
 
 
 def test_malformed_file_redacts_value(documents, caplog, capsys):
@@ -128,8 +140,8 @@ def test_unconfigured_has_no_hidden_default_site():
     loader = auth.BingCredentialLoader()
     assert auth.bing_credentials_state() == "pending"
     assert_failure(loader, "credentials_missing")
-    with pytest.raises(auth.BingAuthError, match="credentials_missing"):
-        _ = loader.allowed_sites
+    assert not hasattr(loader, "allowed_sites")
+    assert not hasattr(loader, "authorize_site")
 
 
 def test_literal_key_private_and_available_is_only_local_shape(documents):
@@ -144,26 +156,47 @@ def test_literal_key_private_and_available_is_only_local_shape(documents):
     assert "api_key" not in document.model_dump()
 
 
-def test_verified_site_allowlist_denies_other_property(documents):
-    # Static operator policy is not a provider verification cache.
+def test_verified_site_allowlist_denies_other_property(documents, monkeypatch):
+    # Retirement map: actual provider membership, not a key loader authorizer.
+    from google_seo_mcp.bing import client
+    from google_seo_mcp.bing.models import BingOperation, BingToolRequest
     loader = configured(documents)
-    loader.authorize_site(SITE)
-    assert loader.allowed_sites == frozenset({SITE})
+    monkeypatch.setattr(httpx, "Client", _REAL_HTTPX_CLIENT)
     for site in ("https://other-public.com/", "http://kelleyconstructioninc.com/",
                  "https://www.kelleyconstructioninc.com/", SITE.rstrip("/"), SITE + "path"):
-        with pytest.raises(auth.BingAuthError, match="site_denied"):
-            loader.authorize_site(site)
+        monkeypatch.setattr(client, "_GLOBAL", client._Admission())
+        sent = []
+        def handler(req, _sent=sent):
+            _sent.append(req.url.path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"d": [{"Url": SITE, "IsVerified": True}]})
+        actual = client.BingReadClient(loader, transport=httpx.MockTransport(handler))
+        req = BingToolRequest(operation=BingOperation.GET_QUERY_STATS, site_url=site)
+        result = actual.read(req.operation, req)
+        assert result.error.code == "site_denied" and result.status == "denied"
+        assert sent == ["GetUserSites"]
+        assert not result.records
 
 
 @pytest.mark.parametrize("sites", [[], ["https://other-public.com/"],
                                   [SITE, "https://other-public.com/"], [SITE, SITE]])
-def test_only_explicit_approved_singleton_policy(documents, sites):
+def test_only_explicit_approved_singleton_policy(documents, sites, monkeypatch):
     write_json(documents.bing_sites_file, {"version": 1, "sites": sites})
-    assert_failure(configured(documents))
-    assert auth.bing_credentials_state() == "invalid"
+    opened = []
+    original = os.open
+    def guarded(path, *args, **kwargs):
+        if path == documents.bing_sites_file.name:
+            opened.append(True)
+            raise PermissionError("retired_policy_read")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(os, "open", guarded)
+    loader = configured(documents)
+    assert loader.load().api_key.get_secret_value() == KEY
+    assert auth.bing_credentials_state() == "available"
+    assert not opened
+    assert not hasattr(loader, "allowed_sites") and not hasattr(loader, "authorize_site")
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 @pytest.mark.parametrize("mode", [0o644, 0o660, 0o666, 0o700, 0o000])
 def test_unprotected_permissions_rejected(documents, target, mode):
     getattr(documents, target).chmod(mode)
@@ -194,7 +227,7 @@ def stat_mode():
     return stat.S_IFREG | 0o600
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 def test_file_size_caps(documents, target):
     cap = 16384 if target == "bing_credentials_file" else 65536
     path = getattr(documents, target)
@@ -244,7 +277,7 @@ def test_parent_symlink_escape_refused(documents):
     assert_failure(configured(documents))
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 @pytest.mark.parametrize("change", ["replace", "rewrite", "delete", "permission"])
 def test_credential_rotation_invalidates_client(documents, target, change):
     loader = configured(documents)
@@ -334,10 +367,10 @@ def test_rotated_key_only_usable_after_recreation(documents):
 def test_missing_after_available_is_pending_never_stale(documents):
     loader = configured(documents)
     loader.load()
-    documents.bing_sites_file.unlink()
+    documents.bing_credentials_file.unlink()
     assert auth.bing_credentials_state() == "pending"
     assert_failure(loader, "credentials_missing")
-    documents.bing_credentials_file.write_text("malformed synthetic", encoding="utf-8")
+    documents.bing_credentials_file.write_bytes(b"{")
     assert auth.bing_credentials_state() == "invalid"
     assert_failure(loader)
 
@@ -417,7 +450,7 @@ def assert_custody_race(documents, monkeypatch, target, baseline, mutate):
     assert_failure(loader)
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 @pytest.mark.parametrize("baseline", [False, True])
 def test_parent_permissions_changed_during_read_must_fail(
     separate_documents, monkeypatch, target, baseline,
@@ -429,7 +462,7 @@ def test_parent_permissions_changed_during_read_must_fail(
     assert_custody_race(separate_documents, monkeypatch, target, baseline, mutate)
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 @pytest.mark.parametrize("baseline", [False, True])
 def test_parent_symlink_swap_during_read_must_fail(
     separate_documents, monkeypatch, target, baseline,
@@ -454,7 +487,7 @@ def test_parent_symlink_swap_during_read_must_fail(
     assert_custody_race(separate_documents, monkeypatch, target, baseline, mutate)
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 @pytest.mark.parametrize("baseline", [False, True])
 @pytest.mark.parametrize("change", ["ancestor_replace", "ancestor_symlink", "parent_missing",
                                    "leaf_missing", "protected_mode"])
@@ -515,7 +548,7 @@ def test_unrelated_ancestor_entries_do_not_invalidate(separate_documents, monkey
     assert auth.bing_credentials_state() == "available"
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 def test_directory_protection_change_between_reads_latches(separate_documents, target):
     loader = configured(separate_documents)
     loader.load()
@@ -571,20 +604,21 @@ def test_custody_descriptors_closed_on_all_paths(separate_documents, monkeypatch
 
 def test_unreadable_policy_wins_missing_key(documents, monkeypatch):
     documents.bing_credentials_file.unlink()
+    opened = []
     original = os.open
-
     def unreadable(path, *args, **kwargs):
         if path == documents.bing_sites_file.name:
-            raise PermissionError("SYNTHETIC-sensitive-exception")
+            opened.append(True)
+            raise PermissionError("retired_policy_read")
         return original(path, *args, **kwargs)
-
     monkeypatch.setattr(os, "open", unreadable)
     loader = configured(documents)
-    assert auth.bing_credentials_state() == "invalid"
-    assert_failure(loader)
+    assert auth.bing_credentials_state() == "pending"
+    assert_failure(loader, "credentials_missing")
+    assert opened == []
 
 
-@pytest.mark.parametrize("target", ["bing_credentials_file", "bing_sites_file"])
+@pytest.mark.parametrize("target", ["bing_credentials_file"])
 @pytest.mark.parametrize("baseline", [False, True])
 @pytest.mark.parametrize("isolate_nlink", [False, True])
 def test_hardlink_at_eof_rejected_independent_of_timestamps(
@@ -711,7 +745,7 @@ def test_all_post_read_leaf_predicates_enforced(
 
 
 # SA-1: every variant below starts a fresh boundary, not an already latched one.
-_ROLES = ("bing_credentials_file", "bing_sites_file")
+_ROLES = ("bing_credentials_file",)
 _CHANGES = ("chmod", "protected_mode", "replace", "replace_changed", "rewrite",
             "delete", "hardlink", "parent_chmod", "parent_protected", "parent_missing",
             "parent_replace", "parent_symlink", "ancestor_replace", "ancestor_symlink",
@@ -781,9 +815,9 @@ def public_snapshot(loader, entry):
     if entry == "state":
         return auth.bing_credentials_state()
     if entry == "sites":
-        return loader.allowed_sites
+        return loader.generation()
     if entry in ("authorize", "denied"):
-        return loader.authorize_site(SITE if entry == "authorize" else "https://other.example/")
+        return loader.require_generation(loader._boundary.generation)
     return loader.load()
 
 
@@ -809,7 +843,7 @@ def rejected_snapshot(loader, entry):
 
 
 def install_cross_read(monkeypatch, documents, target, phase, change, ordinal=1):
-    other = _ROLES[1] if target == _ROLES[0] else _ROLES[0]
+    other = target
     trigger = getattr(documents, other).stat()
     identity = (trigger.st_dev, trigger.st_ino)
     real_read, real_fstat = os.read, os.fstat
@@ -859,7 +893,7 @@ def test_snapshot_symmetric_cross_document_public_matrix(
 
 
 @pytest.mark.parametrize("target", _ROLES)
-@pytest.mark.parametrize("parser", [auth.BingCredentialDocument, auth.BingSitePolicy])
+@pytest.mark.parametrize("parser", [auth.BingCredentialDocument])
 @pytest.mark.parametrize("baseline", [False, True])
 @pytest.mark.parametrize("entry", ["load", "sites", "authorize", "state"])
 @pytest.mark.parametrize("change", ["replace", "hardlink", "ancestor_replace"])
@@ -910,7 +944,7 @@ def test_snapshot_both_baselines_and_handles_span_admission(
         return info
 
     def held():
-        assert len(leaf_fds) == 2
+        assert len(leaf_fds) == 1
         assert set(leaf_fds.values()) <= baselined <= opened
 
     def read(fd, count):
@@ -931,7 +965,6 @@ def test_snapshot_both_baselines_and_handles_span_admission(
         patch.setattr(os, "close", close)
         for model, name in (
             (auth.BingCredentialDocument, separate_documents.bing_credentials_file.name),
-            (auth.BingSitePolicy, separate_documents.bing_sites_file.name),
         ):
             validate = model.model_validate
 
@@ -966,7 +999,9 @@ def test_snapshot_actual_client_zero_dispatch(separate_documents, monkeypatch, t
 
     def handler(request):
         dispatched.append(request.method)
-        return httpx.Response(200, json={"d": []})
+        rows = ([{"Url": SITE, "IsVerified": True}]
+                if business and request.url.path.endswith("/GetUserSites") else [])
+        return httpx.Response(200, json={"d": rows})
 
     def actual_httpx(*args, **kwargs):
         assert isinstance(kwargs["transport"], client._GatedTransport)
@@ -984,7 +1019,8 @@ def test_snapshot_actual_client_zero_dispatch(separate_documents, monkeypatch, t
     assert receipt["fired"] and receipt["count"] == ordinal
     assert filesystem_custody(path) != before
     assert result.status == "unavailable" and result.error.code == "credentials_invalid"
-    assert dispatched == [] and constructed == []
+    assert dispatched == []
+    assert constructed == ([True] if ordinal == 4 else [])
     assert loader._boundary.custody_failed
     receipt["restore"]()
     assert_failure(loader)
@@ -993,7 +1029,8 @@ def test_snapshot_actual_client_zero_dispatch(separate_documents, monkeypatch, t
                                     max_retries=0)
     result = healthy.read(operation, request)
     assert result.status == "empty" and result.error is None
-    assert dispatched == ["GET"] and constructed == [True]
+    assert dispatched == ["GET"] * (2 if business else 1)
+    assert constructed == [True] * ((1 if ordinal == 4 else 0) + (2 if business else 1))
     assert client._GLOBAL.slot.acquire(blocking=False)
     client._GLOBAL.slot.release()
 
@@ -1013,7 +1050,7 @@ def test_snapshot_ancestor_owner_group_drift(separate_documents, monkeypatch, ta
     ancestor = getattr(separate_documents, target).parent.parent.stat()
     identity = (ancestor.st_dev, ancestor.st_ino)
     real_fstat, real_read, real_open = os.fstat, os.read, os.open
-    other = getattr(separate_documents, _ROLES[1] if target == _ROLES[0] else _ROLES[0]).stat()
+    other = getattr(separate_documents, target).stat()
     trigger = (other.st_dev, other.st_ino)
     fired = False
     originals = set()
@@ -1101,9 +1138,9 @@ def test_snapshot_all_leaf_predicates_both_roles(separate_documents, monkeypatch
     assert injected
 
 
-@pytest.mark.parametrize("fault", ["first_walk", "second_walk", "second_leaf", "read_key",
-                                    "read_policy", "parse_key", "parse_policy",
-                                    "observe_key", "observe_policy", "close"])
+@pytest.mark.parametrize("fault", ["first_walk", "second_walk", "key_leaf", "read_key",
+                                    "parse_key",
+                                    "observe_key", "close"])
 def test_snapshot_fault_cleanup_and_privacy(separate_documents, monkeypatch, fault, caplog, capsys):
     loader = configured(separate_documents)
     opened, attempted = set(), []
@@ -1126,7 +1163,7 @@ def test_snapshot_fault_cleanup_and_privacy(separate_documents, monkeypatch, fau
             if (fault == "first_walk" and roots == 1
                     or fault == "second_walk" and roots == 2):
                 fail()
-        if fault == "second_leaf" and path == separate_documents.bing_sites_file.name:
+        if fault == "key_leaf" and path == separate_documents.bing_credentials_file.name:
             fail()
         fd = real_open(path, *a, **k)
         opened.add(fd)
@@ -1153,7 +1190,7 @@ def test_snapshot_fault_cleanup_and_privacy(separate_documents, monkeypatch, fau
         patch.setattr(os, "close", close)
         patch.setattr(os, "read", read)
         if fault.startswith("parse"):
-            model = auth.BingCredentialDocument if fault.endswith("key") else auth.BingSitePolicy
+            model = auth.BingCredentialDocument
             patch.setattr(model, "model_validate", lambda *a, **k: fail())
         if fault.startswith("observe"):
             original = auth._HeldDocument.observe
@@ -1224,30 +1261,26 @@ def test_snapshot_absence_and_invalid_sibling(separate_documents, target, kind):
         path.unlink()
     loader = configured(separate_documents)
     assert_failure(loader, "credentials_missing")
-    other = getattr(separate_documents, _ROLES[1] if target == _ROLES[0] else _ROLES[0])
-    other.write_bytes(b"malformed synthetic")
-    assert_failure(loader)
-    assert loader._boundary.custody_failed
+    separate_documents.bing_sites_file.write_bytes(b"{")
+    assert_failure(loader, "credentials_missing")
+    assert not loader._boundary.custody_failed
 
 
 @pytest.mark.parametrize("target", _ROLES)
 def test_snapshot_pending_sibling_does_not_hide_opened_custody_race(
     separate_documents, monkeypatch, target,
 ):
-    other = _ROLES[1] if target == _ROLES[0] else _ROLES[0]
-    getattr(separate_documents, other).unlink()
+    separate_documents.bing_sites_file.unlink()
     loader = configured(separate_documents)
     path = getattr(separate_documents, target)
     read = os.read
     fired = []
-
     def race(fd, count):
         raw = read(fd, count)
         if not raw and not fired:
             path.chmod(0o666)
             fired.append(True)
         return raw
-
     monkeypatch.setattr(os, "read", race)
     assert_failure(loader)
     assert fired and auth.bing_credentials_state() == "invalid"
@@ -1457,26 +1490,140 @@ def test_snapshot_read_growth_bounded(separate_documents, monkeypatch, target, b
     assert max(requested) <= 8192
 
 
+@pytest.mark.parametrize("change", [*_CHANGES, "malformed", "unreadable", "fifo", "directory"])
+@pytest.mark.parametrize("baseline", [False, True])
+@pytest.mark.parametrize("verified", [False, True])
+def test_retired_policy_custody_is_ignored_not_an_authorizer(
+    separate_documents, monkeypatch, change, baseline, verified,
+):
+    """Map every retired policy geometry to zero reads plus fresh membership."""
+    from google_seo_mcp.bing import client
+    from google_seo_mcp.bing.models import BingOperation, BingToolRequest
+
+    loader = configured(separate_documents)
+    if baseline:
+        loader.load()
+    path = separate_documents.bing_sites_file
+    if change in _CHANGES:
+        snapshot_mutation(path, change)
+    elif change == "malformed":
+        path.write_bytes(b"{")
+    elif change == "unreadable":
+        path.chmod(0)
+    elif change == "fifo":
+        path.unlink()
+        os.mkfifo(path, 0o600)
+    else:
+        path.unlink()
+        path.mkdir(mode=0o700)
+    read_attempts = []
+    real_open = os.open
+
+    def guarded(name, *args, **kwargs):
+        if name == path.name:
+            read_attempts.append(True)
+            raise PermissionError("retired_policy_read")
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", guarded)
+    assert loader.load().api_key.get_secret_value() == KEY
+    generation = loader.generation()
+    loader.require_generation(generation)
+    assert auth.bing_credentials_state() == "available"
+    monkeypatch.setattr(httpx, "Client", _REAL_HTTPX_CLIENT)
+    monkeypatch.setattr(client, "_GLOBAL", client._Admission())
+    sent = []
+
+    def handler(req):
+        stage = req.url.path.rsplit("/", 1)[-1]
+        sent.append(stage)
+        return httpx.Response(200, json={"d": [
+            {"Url": SITE, "IsVerified": verified}
+        ] if stage == "GetUserSites" else []})
+
+    actual = client.BingReadClient(loader, transport=httpx.MockTransport(handler))
+    req = BingToolRequest(operation=BingOperation.GET_QUERY_STATS, site_url=SITE)
+    result = actual.read(req.operation, req)
+    if verified:
+        assert result.status == "empty" and result.error is None
+        assert sent == ["GetUserSites", "GetQueryStats"]
+    else:
+        assert result.status == "denied" and result.error.code == "site_denied"
+        assert sent == ["GetUserSites"]
+    assert read_attempts == []
+
+
+@pytest.mark.parametrize("control_kind", ["keyboard", "system", "async"])
+@pytest.mark.parametrize("cleanup_kind", ["none", "ordinary", "control"])
+@pytest.mark.parametrize("ambient", [False, True])
+def test_key_primary_control_identity_exhaustive_cleanup(
+    documents, monkeypatch, control_kind, cleanup_kind, ambient,
+):
+    import asyncio
+
+    control = {"keyboard": KeyboardInterrupt, "system": SystemExit,
+               "async": asyncio.CancelledError}[control_kind]()
+    cleanup = asyncio.CancelledError()
+    loader = configured(documents)
+    opened, attempted = set(), []
+    real_open, real_close = os.open, os.close
+
+    def acquire(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.add(fd)
+        return fd
+
+    def close(fd):
+        attempted.append(fd)
+        real_close(fd)
+        opened.remove(fd)
+        if len(attempted) == 1:
+            if cleanup_kind == "ordinary":
+                raise OSError("synthetic_close_fault")
+            if cleanup_kind == "control":
+                raise cleanup
+
+    def cancel(*args):
+        raise control
+
+    monkeypatch.setattr(os, "open", acquire)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(os, "read", cancel)
+
+    def invoke():
+        with pytest.raises(BaseException) as caught:
+            loader.load()
+        assert caught.value is control
+
+    if ambient:
+        try:
+            raise LookupError("unrelated_caller")
+        except LookupError:
+            invoke()
+    else:
+        invoke()
+    assert attempted and not opened
+    assert len(attempted) == len(set(attempted))
+    assert loader._boundary.custody_failed is (cleanup_kind != "none")
+
+
 @pytest.mark.parametrize("missing", _ROLES)
 def test_snapshot_missing_role_not_reopened_midcall(separate_documents, monkeypatch, missing):
+    # Key-only acquisition has no sibling read on which to enroll a missing key.
     path = getattr(separate_documents, missing)
     raw = path.read_bytes()
     path.unlink()
     loader = configured(separate_documents)
     read = os.read
-    fired = []
-
-    def enroll(fd, count):
-        result = read(fd, count)
-        if not fired:
-            path.write_bytes(raw)
-            path.chmod(0o600)
-            fired.append(True)
-        return result
-
+    reads = []
+    def tracked(fd, count):
+        reads.append(True)
+        return read(fd, count)
     with monkeypatch.context() as patch:
-        patch.setattr(os, "read", enroll)
+        patch.setattr(os, "read", tracked)
         assert_failure(loader, "credentials_missing")
-    assert fired and path.exists()
+    assert reads == []
+    path.write_bytes(raw)
+    path.chmod(0o600)
     assert_failure(loader)
     assert configured(separate_documents).load().api_key.get_secret_value() == KEY

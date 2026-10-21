@@ -20,9 +20,9 @@ GOOGLE_INDEXING_ENDPOINT = (
 
 def require_indexnow_enabled() -> None:
     """Independent write gate, evaluated before parsing, fetching or key work."""
-    from ..auth import is_hosted_production
+    from ..auth import production_writes_disabled
 
-    if is_hosted_production():
+    if production_writes_disabled():
         raise RuntimeError("indexnow_disabled_in_production")
     if os.getenv("GOOGLE_SEO_ALLOW_INDEXNOW") != "true":
         raise RuntimeError("IndexNow requires GOOGLE_SEO_ALLOW_INDEXNOW=true")
@@ -88,9 +88,9 @@ def submit_google_indexing(
         notification_type: URL_UPDATED | URL_DELETED.
     """
     # Refuse production before credentials, URL processing or any outbound call.
-    from ..auth import _build_creds, is_hosted_production
+    from ..auth import _build_creds, production_writes_disabled
 
-    if is_hosted_production():
+    if production_writes_disabled():
         raise RuntimeError("google_indexing_disabled_in_production")
 
     if notification_type not in {"URL_UPDATED", "URL_DELETED"}:

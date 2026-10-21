@@ -1,7 +1,15 @@
 """Site listing & inspection tools."""
 from __future__ import annotations
 
-from ...auth import get_searchconsole, get_webmasters
+import time
+
+from ...auth import (
+    get_google_account_registry,
+    get_searchconsole,
+    get_webmasters,
+    is_hosted_production,
+)
+from ...google_accounts.models import GoogleRequestDeadline
 from ...guardrails import with_meta
 
 
@@ -10,18 +18,23 @@ def list_sites() -> dict:
 
     Returns each site's URL, permission level, and whether it's a domain or URL property.
     """
-    wm = get_webmasters()
-    resp = wm.sites().list().execute()
-    sites = resp.get("siteEntry", [])
-    return with_meta(
-        [
+    if is_hosted_production():
+        deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+        rows = get_google_account_registry().discovery.list_rows("gsc", deadline)
+    else:
+        wm = get_webmasters()
+        resp = wm.sites().list().execute()
+        sites = resp.get("siteEntry", [])
+        rows = [
             {
                 "site_url": s.get("siteUrl"),
                 "permission_level": s.get("permissionLevel"),
                 "type": "domain" if (s.get("siteUrl") or "").startswith("sc-domain:") else "url",
             }
             for s in sites
-        ],
+        ]
+    return with_meta(
+        rows,
         source="webmasters.sites.list",
         site_url="*",
     )
@@ -37,9 +50,16 @@ def inspect_url(site_url: str, page_url: str, language: str = "en-US") -> dict:
 
     Returns indexing status, last-crawl, canonical, mobile usability, rich-results.
     """
-    sc = get_searchconsole()
     body = {"inspectionUrl": page_url, "siteUrl": site_url, "languageCode": language}
-    resp = sc.urlInspection().index().inspect(body=body).execute()
+    if is_hosted_production():
+        deadline = GoogleRequestDeadline(end=time.monotonic() + 60.0)
+        executor = get_google_account_registry().router.for_gsc(site_url, deadline)
+        resp = executor.execute(
+            lambda sdk: sdk.gsc.urlInspection().index().inspect(body=body).execute(num_retries=0)
+        )
+    else:
+        sc = get_searchconsole()
+        resp = sc.urlInspection().index().inspect(body=body).execute()
     return with_meta(
         resp.get("inspectionResult", {}),
         source="searchconsole.urlInspection.index.inspect",
