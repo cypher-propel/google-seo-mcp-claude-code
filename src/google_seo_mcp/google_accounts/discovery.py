@@ -103,10 +103,12 @@ def _raw_ga4(wire):
                     _text(prop[key], empty=key == "displayName")
             if "canEdit" in prop and type(prop["canEdit"]) is not bool:
                 raise _incomplete()
-            if "propertyType" in prop and prop["propertyType"] not in {
-                "PROPERTY_TYPE_UNSPECIFIED", "PROPERTY_TYPE_ORDINARY",
-                "PROPERTY_TYPE_SUBPROPERTY", "PROPERTY_TYPE_ROLLUP",
-            }:
+            if "propertyType" in prop and not (
+                (type(prop["propertyType"]) is str and prop["propertyType"] in {
+                    "PROPERTY_TYPE_UNSPECIFIED", "PROPERTY_TYPE_ORDINARY",
+                    "PROPERTY_TYPE_SUBPROPERTY", "PROPERTY_TYPE_ROLLUP",
+                }) or (type(prop["propertyType"]) is int and prop["propertyType"] in {0, 1, 2, 3})
+            ):
                 raise _incomplete()
 
 
