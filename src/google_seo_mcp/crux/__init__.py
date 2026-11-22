@@ -9,10 +9,12 @@ https://developer.chrome.com/docs/crux/api
 """
 from __future__ import annotations
 
-import os
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
+
+from ..pagespeed_auth import api_key
 
 CRUX_RECORD_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryRecord"
 CRUX_HISTORY_ENDPOINT = (
@@ -21,7 +23,7 @@ CRUX_HISTORY_ENDPOINT = (
 
 
 def _api_key() -> str | None:
-    return os.getenv("CRUX_API_KEY") or os.getenv("PAGESPEED_API_KEY")
+    return api_key(crux=True)
 
 
 def _post_crux(endpoint: str, body: dict, timeout: float = 30.0) -> dict[str, Any]:
@@ -34,16 +36,19 @@ def _post_crux(endpoint: str, body: dict, timeout: float = 30.0) -> dict[str, An
         )
     try:
         with httpx.Client(timeout=timeout) as client:
-            resp = client.post(f"{endpoint}?key={key}", json=body)
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"CrUX request failed: {type(e).__name__}: {e}") from None
+            resp = client.post(f"{endpoint}?{urlencode({'key': key})}", json=body)
+    except httpx.HTTPError:
+        raise RuntimeError("provider_unavailable") from None
     if resp.status_code == 404:
         # CrUX returns 404 when the URL/origin isn't in the public dataset
         # (insufficient real-user traffic). Treat this as "no data".
         return {"_no_data": True}
     if resp.status_code >= 400:
-        raise RuntimeError(f"CrUX API returned {resp.status_code}: {resp.text[:300]}")
-    return resp.json()
+        raise RuntimeError("provider_unavailable")
+    try:
+        return resp.json()
+    except ValueError:
+        raise RuntimeError("provider_unavailable") from None
 
 
 def query_record(

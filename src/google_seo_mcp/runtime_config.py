@@ -80,6 +80,9 @@ class ProductionRuntimeConfig(BaseModel):
     google_approved_client_id: str | None = Field(default=None, repr=False)
     google_approved_project_id: str | None = Field(default=None, repr=False)
     require_google_credentials: bool = Field(default=False, strict=True)
+    pagespeed_api_key_file: Path = Field(
+        default=Path("/run/secrets/pagespeed-api-key"), repr=False
+    )
     bing_credentials_file: Path = Field(
         default=Path("/run/secrets/bing-webmaster.json"), repr=False
     )
@@ -89,6 +92,13 @@ class ProductionRuntimeConfig(BaseModel):
     allow_private_fetch: bool = Field(default=False, strict=True)
     allow_destructive: bool = Field(default=False, strict=True)
     debug: bool = Field(default=False, strict=True)
+
+    @field_validator("pagespeed_api_key_file")
+    @classmethod
+    def validate_pagespeed_path(cls, value: Path) -> Path:
+        if value != Path("/run/secrets/pagespeed-api-key"):
+            raise ValueError("invalid PageSpeed key path")
+        return value
 
     @field_validator(
         "bing_credentials_file", "consumer_keys_file", "service_account_file",

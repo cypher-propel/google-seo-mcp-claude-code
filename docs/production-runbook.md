@@ -83,7 +83,14 @@ The exact hosted catalog is derived from the names in the packaged
 [`production_tools.json`](../src/google_seo_mcp/production_tools.json): the unchanged
 35 GSC/GA4/cross-platform/SERP reads (including `serp_check`, `serp_aio_monitor`,
 `serp_paa_extractor` and `serp_competitor_intersect`) plus exactly the eleven
-isolated Bing reads below. Catalog presence does not certify live Bing readiness.
+isolated Bing reads below and exactly six PageSpeed-backed reads:
+`lighthouse_audit`, `lighthouse_core_web_vitals`, `lighthouse_lcp_opportunities`,
+`lighthouse_compare_mobile_desktop`, `lighthouse_seo_score` and `crux_current`.
+The exact hosted total is 52. Catalog presence does not certify live provider readiness.
+Hosted Lighthouse and CrUX read their shared API key lazily from the fixed
+`/run/secrets/pagespeed-api-key` file. They do not use OAuth custody or export the
+value to `PAGESPEED_API_KEY`; a missing key returns `provider_not_configured`.
+Provider failures return `provider_unavailable` without upstream text or request URLs.
 Registration and direct dispatch both enforce the manifest. Arbitrary fetch,
 crawl/browser, local file, logs/history, metadata/credential reload, Google
 Indexing, sitemap writes and IndexNow are excluded. Future names require review
@@ -383,7 +390,10 @@ outcomes must stay distinct from positive data and business qualification.
 
 `scripts/smoke_http.py` is catalog-only and makes zero `tools/call` requests; it
 selects no Google property. Both smoke helpers derive the catalog from the
-installed packaged manifest and retain independent frozen OLD/BING guard sets.
+installed packaged manifest and retain independent OLD/BING/PAGESPEED guard sets
+for the exact 52-tool catalog. `scripts/audit_production.py` independently pins the
+same catalog. The Bing helper's business-call scope remains exactly eleven Bing
+reads; admitting six PageSpeed names does not add provider calls to either smoke.
 Do not treat a source import or an old installed manifest as new-image proof.
 
 `scripts/smoke_bing.py` keeps its closed eleven names, fixed hosted origin and

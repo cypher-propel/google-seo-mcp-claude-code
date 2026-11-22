@@ -6,11 +6,12 @@ faster. See https://developers.google.com/speed/docs/insights/v5/get-started
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+
+from ..pagespeed_auth import api_key
 
 PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
@@ -29,9 +30,9 @@ def _build_url(
     ]
     for c in categories or ["performance", "accessibility", "best-practices", "seo"]:
         params.append(("category", c.upper()))
-    api_key = os.getenv("PAGESPEED_API_KEY")
-    if api_key:
-        params.append(("key", api_key))
+    key = api_key()
+    if key:
+        params.append(("key", key))
     return f"{PSI_ENDPOINT}?{urlencode(params)}"
 
 
@@ -47,11 +48,14 @@ def call_psi(
     try:
         with httpx.Client(timeout=timeout) as client:
             resp = client.get(full_url)
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"PSI request failed: {type(e).__name__}: {e}") from None
+    except httpx.HTTPError:
+        raise RuntimeError("provider_unavailable") from None
     if resp.status_code >= 400:
-        raise RuntimeError(f"PSI API returned {resp.status_code}: {resp.text[:300]}")
-    return resp.json()
+        raise RuntimeError("provider_unavailable")
+    try:
+        return resp.json()
+    except ValueError:
+        raise RuntimeError("provider_unavailable") from None
 
 
 def extract_field_data(psi: dict[str, Any]) -> dict[str, Any]:

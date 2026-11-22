@@ -33,6 +33,11 @@ BING = frozenset({
     "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
     "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
 })
+PAGESPEED = frozenset({
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
+})
 PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
     "100.64.0.0/10", "::1/128", "fc00::/7",
@@ -98,7 +103,8 @@ async def smoke(options: argparse.Namespace) -> dict[str, str | int]:
     if (
         manifest["version"] != 1 or not isinstance(expected, list)
         or any(type(name) is not str for name in expected)
-        or set(expected) != OLD | BING or OLD & BING
+        or set(expected) != OLD | BING | PAGESPEED or OLD & BING
+        or PAGESPEED & (OLD | BING) or len(expected) != 52
         or len(set(expected)) != len(expected)
     ):
         raise SmokeFailure()

@@ -23,7 +23,12 @@ from mcp.client.streamable_http import streamable_http_client
 ROOT = Path(__file__).resolve().parents[1]
 OLD35 = frozenset({'cross_gsc_to_ga4_journey', 'cross_landing_page_full_diagnosis', 'cross_multi_property_comparison', 'cross_opportunity_matrix', 'cross_seo_to_revenue_attribution', 'cross_traffic_health_check', 'ga4_anomalies', 'ga4_channel_attribution', 'ga4_cohort_retention', 'ga4_content_decay', 'ga4_conversion_funnel', 'ga4_estimate_query_size', 'ga4_event_volume_comparison', 'ga4_get_property_details', 'ga4_landing_page_health', 'ga4_list_properties', 'ga4_list_schema_categories', 'ga4_query', 'ga4_search_schema', 'ga4_traffic_drops_by_channel', 'gsc_alerts', 'gsc_cannibalization', 'gsc_content_decay', 'gsc_ctr_opportunities', 'gsc_inspect_url', 'gsc_list_sitemaps', 'gsc_list_sites', 'gsc_quick_wins', 'gsc_search_analytics', 'gsc_site_snapshot', 'gsc_traffic_drops', 'serp_aio_monitor', 'serp_check', 'serp_competitor_intersect', 'serp_paa_extractor'})
 BING11 = frozenset({'bing_list_sites', 'bing_rank_traffic_stats', 'bing_query_stats', 'bing_page_stats', 'bing_page_query_stats', 'bing_query_page_stats', 'bing_crawl_stats', 'bing_crawl_issues', 'bing_url_info', 'bing_list_sitemaps', 'bing_sitemap_details'})
-EXPECTED46 = OLD35 | BING11
+PAGESPEED6 = frozenset({
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
+})
+EXPECTED52 = OLD35 | BING11 | PAGESPEED6
 PILOT = 'https://kelleyconstructioninc.com/'
 BING_PRIVATE = 'SYNTHETIC_BING_KEY_NOT_ENROLLED+/=%'
 PRIVATE = 'SYNTHETIC_PRIVATE_ARGUMENT_AND_UPSTREAM_EXCEPTION'
@@ -386,8 +391,8 @@ async def sdk_catalog(server, identity='alpha', path='/mcp', calls=()):
             assert cursor not in seen
             seen.add(cursor)
         assert len(OLD35) == 35 and len(BING11) == 11 and (not OLD35 & BING11)
-        assert len(names) == len(set(names)) == 46
-        assert set(names) == EXPECTED46
+        assert len(names) == len(set(names)) == 52
+        assert set(names) == EXPECTED52
         results = []
         for name, arguments in calls:
             results.append(await session.call_tool(name, arguments))
@@ -516,7 +521,7 @@ def test_two_sync_calls_offload_worker_keep_health_responsive_and_third_is_429(l
 
 def test_google_vendor_missing_and_fenced_direct_calls_never_network_or_open(launch):
     server = launch()
-    fenced = ('gsc_submit_sitemap', 'google_indexing_publish', 'google_indexing_delete', 'indexnow_submit', 'indexnow_submit_sitemap', 'indexnow_generate_key', 'logs_parse', 'history_list', 'history_save_snapshot', 'migration_wp_audit_site', 'schema_extract_url', 'aeo_llms_txt_check', 'lighthouse_audit', 'crawl_url', 'get_capabilities', 'reauthenticate', 'reload_credentials', 'gsc_list_sites_alias', '../gsc_list_sites', 'GSC_LIST_SITES')
+    fenced = ('gsc_submit_sitemap', 'google_indexing_publish', 'google_indexing_delete', 'indexnow_submit', 'indexnow_submit_sitemap', 'indexnow_generate_key', 'logs_parse', 'history_list', 'history_save_snapshot', 'migration_wp_audit_site', 'schema_extract_url', 'aeo_llms_txt_check', 'crawl_url', 'get_capabilities', 'reauthenticate', 'reload_credentials', 'gsc_list_sites_alias', '../gsc_list_sites', 'GSC_LIST_SITES')
     results = asyncio.run(sdk_catalog(server, calls=[(name, {'path': '/' + PRIVATE, 'url': 'https://' + PRIVATE + '.invalid'}) for name in fenced] + [('gsc_list_sites', {}), ('serp_check', {'keyword': 'offline'})]))
     for result in results[:-2]:
         assert result.isError and 'tool_not_allowed' in result.model_dump_json()

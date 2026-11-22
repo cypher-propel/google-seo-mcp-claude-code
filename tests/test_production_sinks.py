@@ -350,6 +350,10 @@ def test_hosted_read_sitemap_behavior_unchanged(hosted, sink_google_wire, monkey
 def bing_server(request, monkeypatch):
     monkeypatch.setattr(server, "_configure_hosted_logging", lambda: None)
     monkeypatch.setattr(bing_client, "_GLOBAL", bing_client._Admission())
+    # HTTP fixture custody and final egress custody are independent loader uses.
+    # Keep backend generation/read counters isolated from the final scanner.
+    monkeypatch.setattr(bing_auth.BingCredentialLoader, "load",
+                        lambda self: SyntheticBingLoader().load())
     bing_tools.configure_bing_tools()
     instance = (
         server.mcp
@@ -559,15 +563,22 @@ def test_pending_bing_calls_no_http_and_composition_is_lazy(
         ):
             for row in BING_ROUTES:
                 result = sdk_call(instance, row[0], bing_arguments(row))
-                assert result["isError"] is False  # SDK completion, NOT business success
-                value = json.loads(result["content"][0]["text"])
-                assert value["data"]["status"] == "unavailable"
-                assert value["data"]["error"]["code"] == "provider_not_configured"
-                assert value["data"]["records"] == []
-                assert value["_meta"]["source"] == "bing_webmaster"
+                if profile == "production":
+                    # Incumbent hosted egress requires independent provider
+                    # custody even for an unavailable business envelope.
+                    assert result["isError"] is True
+                    assert result["content"][0]["text"] == "provider_unavailable"
+                else:
+                    assert result["isError"] is False  # NOT business success
+                    value = json.loads(result["content"][0]["text"])
+                    assert value["data"]["status"] == "unavailable"
+                    assert value["data"]["error"]["code"] == "provider_not_configured"
+                    assert value["data"]["records"] == []
+                    assert value["_meta"]["source"] == "bing_webmaster"
         assert acquired == [
             (config.bing_credentials_file, "pending", None, None)
-            for _ in BING_ROUTES
+            # One backend load plus one independent hosted egress scan.
+            for _ in range(len(BING_ROUTES) * (2 if profile == "production" else 1))
         ]
         deny.assert_not_called()
     finally:

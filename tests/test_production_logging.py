@@ -280,6 +280,12 @@ def test_real_authenticated_request_and_worker_audit_survive(tmp_path):
     result = probe(tmp_path, r'''
 from mcp.server.fastmcp.exceptions import ToolError
 from google_seo_mcp.tool_policy import ProductionToolPolicy
+from types import SimpleNamespace
+from google_seo_mcp.google_accounts.clients import GoogleAccountClients
+# The controlled worker still traverses the real credential-aware egress guard.
+GoogleAccountClients.scan_credentials = lambda self: (
+    SimpleNamespace(client_secret='synthetic-logging-client-secret-9248',
+                    refresh_token='synthetic-logging-refresh-token-9248', token=None),)
 manager = server.PolicyToolManager(ProductionToolPolicy())
 def controlled_worker():
     logging.getLogger('worker.private').error(PRIVATE)
@@ -349,7 +355,7 @@ root = logging.getLogger()
 original = (logging.Logger.callHandlers, logging.lastResort, root.handlers[:], root.level)
 first = server.create_server(hosted)
 second = server.create_server(hosted)
-assert len(first._tool_manager.list_tools()) == len(second._tool_manager.list_tools()) == 46
+assert len(first._tool_manager.list_tools()) == len(second._tool_manager.list_tools()) == 52
 late = logging.getLogger('restore.created.hosted')
 late.handlers[:] = [logging.StreamHandler(sys.stderr)]
 late.propagate = False

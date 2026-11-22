@@ -302,7 +302,7 @@ def test_pending_zero_bing_calls(monkeypatch):
     monkeypatch.setattr(smoke.httpx, "AsyncClient", client)
     result = asyncio.run(smoke.run(opts))
     assert result["status"] == "PENDING_CATALOG_ONLY"
-    assert result["catalog_count"] == 46
+    assert result["catalog_count"] == 52
     assert result["bing_sdk_calls"] == 0 and peer.calls == []
 
 
