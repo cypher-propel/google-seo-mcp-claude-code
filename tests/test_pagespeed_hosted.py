@@ -6,6 +6,8 @@ import io
 import json
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs
@@ -208,10 +210,7 @@ def test_guard_releases_on_pagespeed_not_oauth_and_keeps_google_scan(
     assert server._protect_hosted_result({"ok": True}, "gsc_list_sites") == {"ok": True}
 
 
-@pytest.mark.parametrize("mode", [200, 429, "timeout", "reflection"])
-@pytest.mark.parametrize("name", ["lighthouse_audit", "crux_current"])
-def test_actual_hosted_logs_and_audit_never_contain_fixture_key(hosted, monkeypatch, mode, name):
-    instance, _ = hosted
+def _assert_log_probe(instance, monkeypatch, mode, name):
     install_wire(monkeypatch, status=mode if isinstance(mode, int) else 200,
                  failure=mode, reflected=mode == "reflection")
     captured = io.StringIO()
@@ -236,3 +235,38 @@ def test_actual_hosted_logs_and_audit_never_contain_fixture_key(hosted, monkeypa
 
 
 REAL_CONFIGURE_LOGGING = server._configure_hosted_logging
+
+
+@pytest.mark.parametrize("mode", [200, 429, "timeout", "reflection"])
+@pytest.mark.parametrize("name", ["lighthouse_audit", "crux_current"])
+def test_actual_hosted_logs_and_audit_never_contain_fixture_key(tmp_path, mode, name):
+    # Process-wide logger disable/filter state from other suites must not turn
+    # an empty capture into either a false pass or a false failure. Exercise the
+    # actual composition/delivery guard in a clean process, as the hosted service
+    # runs it; retain both the key-absence and positive audit-record assertions.
+    root = Path(__file__).resolve().parents[1]
+    script = """
+import json, sys
+from pathlib import Path
+import pytest
+from tests.test_pagespeed_hosted import hosted, _assert_log_probe
+with pytest.MonkeyPatch.context() as patch:
+    fixture = hosted.__wrapped__(patch, Path(sys.argv[1]))
+    instance, _ = next(fixture)
+    try:
+        _assert_log_probe(instance, patch, json.loads(sys.argv[2]), sys.argv[3])
+    finally:
+        fixture.close()
+"""
+    environment = {
+        "HOME": str(tmp_path), "TMPDIR": str(tmp_path), "LANG": "C.UTF-8",
+        "PATH": f"{Path(sys.executable).parent}:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(root), str(Path(server.__file__).parent.parent))),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), json.dumps(mode), name],
+        cwd=root, env=environment, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == result.stderr == ""
