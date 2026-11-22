@@ -1,6 +1,6 @@
 # Official Python image metadata and linux/amd64 manifest verified from Docker Hub.
-# Python 3.11.17, bookworm; rebuild/requalify explicitly when this digest changes.
-FROM python:3.11-slim-bookworm@sha256:8a00ecb83ed9d0864dfd102a1bdb2067fda907ceb30bb86d09da9ee558b19590 AS wheel-builder
+# Python 3.11.18, bookworm; rebuild/requalify explicitly when this digest changes.
+FROM python:3.11-slim-bookworm@sha256:e8c69d86735f6df3efa06b324694fe51f0422785f83a3bd463052636c2421944 AS wheel-builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -45,14 +45,14 @@ RUN python -m pip wheel --no-index --no-build-isolation --no-deps --wheel-dir /a
     && /opt/venv/bin/python -c 'from pathlib import Path; import sysconfig,zipfile; z=zipfile.ZipFile("/opt/venv/share/qualified-application/google_seo_mcp-0.8.5-py3-none-any.whl"); root=Path(sysconfig.get_path("purelib")); members=[n for n in z.namelist() if n.startswith("google_seo_mcp/") and not n.endswith("/")]; manifest=__import__("json").loads(Path("/opt/venv/share/qualified-application/source-members.json").read_text()); assert members and set(members)==set(manifest); assert all(__import__("hashlib").sha256(z.read(n)).hexdigest()==manifest[n] and (root/n).read_bytes()==z.read(n) for n in members), "Installed application differs from built source/archive"' \
     && cp /wheelhouse/runtime-wheels.lock /opt/venv/share/runtime-wheels.lock
 
-FROM python:3.11-slim-bookworm@sha256:8a00ecb83ed9d0864dfd102a1bdb2067fda907ceb30bb86d09da9ee558b19590 AS runtime
+FROM python:3.11-slim-bookworm@sha256:e8c69d86735f6df3efa06b324694fe51f0422785f83a3bd463052636c2421944 AS runtime
 
 ARG GOOGLE_SEO_REVISION=unknown
 ENV GOOGLE_SEO_REVISION=${GOOGLE_SEO_REVISION}
 LABEL org.opencontainers.image.source="https://github.com/cypher-propel/google-seo-mcp-claude-code" \
       org.opencontainers.image.revision="${GOOGLE_SEO_REVISION}" \
       org.opencontainers.image.base.name="docker.io/library/python:3.11-slim-bookworm" \
-      org.opencontainers.image.base.digest="sha256:8a00ecb83ed9d0864dfd102a1bdb2067fda907ceb30bb86d09da9ee558b19590"
+      org.opencontainers.image.base.digest="sha256:e8c69d86735f6df3efa06b324694fe51f0422785f83a3bd463052636c2421944"
 
 # Remove global tooling and ensurepip, including its bundled bootstrap wheels.
 # Dependency checking uses builder-only external pip; runtime has no installer.
