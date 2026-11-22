@@ -50,7 +50,7 @@ EXPECTED = frozenset(
     "serp_paa_extractor",
     "serp_competitor_intersect",
 }
-# Keep the historical 35-tool sink/semantics matrix separate from Bing.
+# Keep the historical 35-tool sink/semantics matrix separate from later additions.
 ORIGINAL_EXPECTED = EXPECTED
 BING_NAMES = frozenset({
     "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats",
@@ -58,8 +58,13 @@ BING_NAMES = frozenset({
     "bing_crawl_stats", "bing_crawl_issues", "bing_url_info",
     "bing_list_sitemaps", "bing_sitemap_details",
 })
-EXPECTED = ORIGINAL_EXPECTED | BING_NAMES
-EXCLUDED = BASELINE - ORIGINAL_EXPECTED
+PAGESPEED_NAMES = frozenset({
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
+})
+EXPECTED = ORIGINAL_EXPECTED | BING_NAMES | PAGESPEED_NAMES
+EXCLUDED = BASELINE - EXPECTED
 # Independent accepted-plan section 2/5 inventory: mutations (including GET
 # FetchUrl), deferred reads, generic proxies, configuration seams and aliases.
 BING_FORBIDDEN = [
@@ -106,6 +111,9 @@ def hosted(monkeypatch):
     # unit composition must not remove pytest's process-wide capture handlers.
     monkeypatch.setattr(server, "_configure_hosted_logging", lambda: None)
     monkeypatch.delenv("GOOGLE_SEO_PROFILE", raising=False)
+    # Vendor backend substitution still requires independent egress custody.
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "synthetic-policy-vendor-login-9248")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "synthetic-policy-vendor-password-9248")
     instance = server.create_server(
         load_runtime_config([], {"GOOGLE_SEO_TRANSPORT": "streamable-http"})
     )
@@ -118,8 +126,11 @@ def test_catalog_is_exact_static_baseline_expansion_and_stdio_is_intact(hosted):
     assert len(ORIGINAL_EXPECTED) == 35
     assert len(BING_NAMES) == 11
     assert not BASELINE & BING_NAMES
-    assert len(EXPECTED) == 46
-    assert len(EXCLUDED) == 67
+    assert len(PAGESPEED_NAMES) == 6
+    assert PAGESPEED_NAMES <= BASELINE
+    assert not PAGESPEED_NAMES & (ORIGINAL_EXPECTED | BING_NAMES)
+    assert len(EXPECTED) == 52
+    assert len(EXCLUDED) == 61
     assert ProductionToolPolicy().names == EXPECTED
     assert {tool.name for tool in hosted._tool_manager.list_tools()} == EXPECTED
     assert {tool.name for tool in server.mcp._tool_manager.list_tools()} == BASELINE | BING_NAMES
@@ -468,7 +479,18 @@ def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
                 patch.object(server.serp_tools, "call_dataforseo", side_effect=vendor)
             )
             stack.enter_context(patch("builtins.open", sink))
-            stack.enter_context(patch.object(Path, "open", sink))
+            # The incumbent egress guard re-reads its static package manifest.
+            # Permit only that exact read; caller-selected paths stay trapped.
+            path_open = Path.open
+            manifest = Path(server.__file__).with_name("production_tools.json")
+            def guarded_open(path, *args, **kwargs):
+                if path == manifest and not args and not kwargs:
+                    return path_open(path)
+                # pathlib.read_text supplies explicit read-only parameters.
+                if path == manifest and kwargs.get("mode") == "r":
+                    return path_open(path, *args, **kwargs)
+                return sink(path, *args, **kwargs)
+            stack.enter_context(patch.object(Path, "open", guarded_open))
             stack.enter_context(patch.object(socket, "getaddrinfo", sink))
             stack.enter_context(patch.object(socket.socket, "connect", sink))
             stack.enter_context(patch.object(socket.socket, "connect_ex", sink))
@@ -506,7 +528,13 @@ def test_each_allowed_backend_reaches_only_fixed_mocked_google_or_vendor_sink(
             close_resources([*sessions, *wire.responses], primary)
 
 
-def test_worker_bound_retains_validated_consumer_context(hosted):
+def test_worker_bound_retains_validated_consumer_context(hosted, monkeypatch):
+    # Backend replacement does not replace the final credential scanner.
+    from google_seo_mcp.google_accounts.clients import GoogleAccountClients
+    monkeypatch.setattr(GoogleAccountClients, "scan_credentials", lambda self: (
+        SimpleNamespace(client_secret="synthetic-worker-client-secret-9248",
+                        refresh_token="synthetic-worker-refresh-token-9248", token=None),
+    ))
     async def exercise():
         hosted._tool_manager.remove_tool("gsc_list_sites")
         gate, lock, entered = threading.Event(), threading.Lock(), []
@@ -561,6 +589,13 @@ socket.socket.connect = denied
 socket.socket.connect_ex = denied
 server.auth_module.google_auth_default = denied
 server.auth_module.SACredentials.from_service_account_file = denied
+
+# Controlled custody for replaced handlers; retain the actual final scanner.
+from types import SimpleNamespace
+from google_seo_mcp.google_accounts.clients import GoogleAccountClients
+GoogleAccountClients.scan_credentials = lambda self: (
+    SimpleNamespace(client_secret='synthetic-audit-client-secret-9248',
+                    refresh_token='synthetic-audit-refresh-token-9248', token=None),)
 
 async def exercise():
     captured = io.StringIO()

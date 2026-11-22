@@ -44,6 +44,9 @@ EXPECTED_TOOLS = frozenset({
     "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats", "bing_page_stats",
     "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
     "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
 })
 PUBLIC = "https://google-seo.mcp.propel.marketing/mcp"
 MOCK_TOKEN = "synthetic-operator-test-not-a-consumer-secret"
@@ -169,13 +172,13 @@ def assert_failure_leaves(error, expected_type):
 
 def test_smoke_real_sdk_exhausts_pages_without_business_calls(smoke_module, monkeypatch):
     assert {"version": 1, "tools": sorted(EXPECTED_TOOLS)} == MANIFEST
-    assert len(EXPECTED_TOOLS) == 46
+    assert len(EXPECTED_TOOLS) == 52
     names = sorted(EXPECTED_TOOLS)
     pages = {None: (names[:11], "page-2"), "page-2": (names[11:25], "page-3"),
              "page-3": (names[25:], None)}
     observed, clients = install_mock_mcp(monkeypatch, pages)
     result = asyncio.run(smoke_module.smoke(smoke_options()))
-    assert result == {"status": "PASS", "catalog_count": 46, "revision": "unavailable"}
+    assert result == {"status": "PASS", "catalog_count": 52, "revision": "unavailable"}
     assert_discovery_only(observed)
     assert [body.get("params", {}).get("cursor") for _, body in observed
             if body and body.get("method") == "tools/list"] == [None, "page-2", "page-3"]
@@ -204,7 +207,7 @@ def test_smoke_real_sdk_refuses_bad_catalog(smoke_module, monkeypatch, catalog_c
         pages = {None: ([], "again"), "again": ([], "again")}
     elif catalog_case == "endless":
         pages = {None: ([], "0")}
-        pages.update({str(i): ([], str(i + 1)) for i in range(46)})
+        pages.update({str(i): ([], str(i + 1)) for i in range(52)})
     else:
         pages = {None: (names, None)}
     observed, _ = install_mock_mcp(monkeypatch, pages)
@@ -212,12 +215,12 @@ def test_smoke_real_sdk_refuses_bad_catalog(smoke_module, monkeypatch, catalog_c
         asyncio.run(smoke_module.smoke(smoke_options()))
     assert_failure_leaves(caught.value, smoke_module.SmokeFailure)
     assert_discovery_only(observed)
-    assert len(observed) <= 51
+    assert len(observed) <= 57
     if catalog_case == "endless":
         cursors = [body.get("params", {}).get("cursor") for _, body in observed
                    if body and body.get("method") == "tools/list"]
-        assert cursors == [None] + [str(i) for i in range(46)]
-        assert len(observed) == 51  # 47 pages + anonymous/health/initialize/notification.
+        assert cursors == [None] + [str(i) for i in range(52)]
+        assert len(observed) == 57  # 53 pages + anonymous/health/initialize/notification.
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -424,7 +427,7 @@ def test_audit_coherent_mock_fixture_retains_evidence(
     code, summary, output = invoke_audit(audit_module, tmp_path, capsys, mode)
     assert code == 0
     assert {"version": 1, "tools": sorted(EXPECTED_TOOLS)} == MANIFEST
-    assert summary["runtime_distributions"] == 76 and summary["manifest_tools"] == 46
+    assert summary["runtime_distributions"] == 76 and summary["manifest_tools"] == 52
     assert summary["twisted_chain"] == "absent"
     assert summary["python_audit"]["distributions"] == 75
     assert summary["python_audit"]["findings"] == 0  # MOCK fixture, not a real scan result.

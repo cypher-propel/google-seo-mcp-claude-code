@@ -82,7 +82,12 @@ OLD = frozenset(
         "serp_paa_extractor",
     ]
 )
-EXPECTED = OLD | frozenset(BING)
+PAGESPEED = frozenset({
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
+})
+EXPECTED = OLD | frozenset(BING) | PAGESPEED
 SYNTHETIC_TOKEN = "SYNTHETIC-not-a-real-consumer-key"
 TOOLS_SHA256 = "181c6c512c7e42820d2565c2047338609a667eca3e2332fcd5b41c1ccb1f79bf"
 OPERATIONS = dict(
@@ -116,14 +121,15 @@ class SafeParser(argparse.ArgumentParser):
 
 
 def packaged_catalog():
-    """Derive names from the installed manifest; retain independent old/Bing guards."""
+    """Derive names from the manifest; independently pin all admitted families."""
     doc = json.loads(files("google_seo_mcp").joinpath("production_tools.json").read_text())
     names = doc["tools"]
     if (
         doc["version"] != 1 or type(names) is not list
         or any(type(name) is not str for name in names)
         or len(names) != len(set(names)) or OLD & frozenset(BING)
-        or set(names) != EXPECTED
+        or PAGESPEED & (OLD | frozenset(BING))
+        or len(names) != 52 or set(names) != EXPECTED
     ):
         raise SmokeFailure("catalog_manifest_mismatch")
     return frozenset(names)

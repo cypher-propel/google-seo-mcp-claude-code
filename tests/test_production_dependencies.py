@@ -27,6 +27,11 @@ ORIGINAL_PRODUCTION_NAMES = frozenset(
 ) | {'serp_check', 'serp_aio_monitor', 'serp_paa_extractor', 'serp_competitor_intersect'}
 
 ROOT = Path(__file__).resolve().parents[1]
+PAGESPEED_NAMES = frozenset({
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
+})
 FORBIDDEN = {
     "advertools", "scrapy", "twisted", "playwright", "statsmodels", "scipy", "pytest",
     "pytest-mock", "ruff", "pip-audit", "pip-tools", "build", "setuptools", "wheel", "packaging",
@@ -132,19 +137,21 @@ def test_container_source_security_contract_without_claiming_image_execution():
     assert ["python", "-m", "pip", "--python", "/opt/venv/bin/python", "check"] in commands
     programs = [ast.parse(command[2]) for command in commands
                 if command[:2] == ["python", "-c"] and len(command) == 3]
+    # The incumbent builder now builds THIS source rather than copying an old
+    # qualified archive. Pin and exercise that stronger guard, without an image.
+    guard_expression = "members and members == source"
     guarded = [program for program in programs if any(
         isinstance(node, ast.Assert) and ast.dump(node.test) == ast.dump(
-            ast.parse("members == source", mode="eval").body)
+            ast.parse(guard_expression, mode="eval").body)
         for node in program.body)]
     assert len(guarded) == 1
     program = guarded[0]
     assignments = {node.targets[0].id: node for node in program.body
                    if isinstance(node, ast.Assign) and len(node.targets) == 1
                    and isinstance(node.targets[0], ast.Name)}
-    # Pin the actual data-flow: archive bytes and all copied source/data bytes,
-    # including JSON, feed the same equality assertion with no suffix whitelist.
     expected = {
-        "p": 'Path("google_seo_mcp-0.8.5-py3-none-any.whl")',
+        "wheels": 'list(Path("/application").glob("*.whl"))',
+        "p": 'wheels[0]',
         "z": 'zipfile.ZipFile(p)',
         "members": '{n:z.read(n) for n in z.namelist() '
                    'if n.startswith("google_seo_mcp/") and not n.endswith("/")}',
@@ -156,42 +163,47 @@ def test_container_source_security_contract_without_claiming_image_execution():
     for name, expression in expected.items():
         assert ast.dump(assignments[name].value) == ast.dump(
             ast.parse(expression, mode="eval").body)
-    archive_name = ast.literal_eval(assignments["p"].value.args[0])
-    assert f"COPY deploy/image-build/{archive_name} ./" in builder
+    checks = {ast.dump(node.test): node for node in program.body
+              if isinstance(node, ast.Assert)}
+    for expression in ('len(wheels) == 1',
+                       'p.name == "google_seo_mcp-0.8.5-py3-none-any.whl"',
+                       'len(z.namelist()) == len(set(z.namelist()))'):
+        assert ast.dump(ast.parse(expression, mode="eval").body) in checks
+    assert ["python", "-m", "pip", "wheel", "--no-index", "--no-build-isolation",
+            "--no-deps", "--wheel-dir", "/application", "."] in commands
+    assert not any(line.startswith("COPY deploy/image-build/") for line in builder)
+    import io
     import zipfile
 
-    # Do not demand full current-wire equality with the inherited qualified wheel:
-    # the parent binds the fresh candidate later. Exercise the actual catalog bytes.
-    with zipfile.ZipFile(ROOT / "deploy/image-build" / archive_name) as archive, \
-            pytest.MonkeyPatch.context() as context:
+    # Build only an in-memory test archive from actual checked-out package bytes.
+    # This tests the extracted mapping/guard, NOT wheel or image qualification.
+    with pytest.MonkeyPatch.context() as context:
         context.chdir(ROOT)
-        namespace = {"z": archive, "Path": Path}
-        for name in ("members", "source"):
-            exec(compile(ast.Module(body=[assignments[name]], type_ignores=[]),
-                         "<Dockerfile source/data mapping>", "exec"), namespace)
-        counts = [node for node in program.body if isinstance(node, ast.Assert)
-                  and ast.dump(node.test) == ast.dump(ast.parse(
-                      "len(z.namelist()) == 83 and len(members) == 77", mode="eval").body)]
-        assert len(counts) == 1
-        exec(compile(ast.Module(body=counts, type_ignores=[]),
-                     "<Dockerfile archive counts>", "exec"), namespace)
+        namespace = {"Path": Path}
+        exec(compile(ast.Module(body=[assignments["source"]], type_ignores=[]),
+                     "<Dockerfile source mapping>", "exec"), namespace)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, data in namespace["source"].items():
+                archive.writestr(name, data)
+        with zipfile.ZipFile(buffer) as archive:
+            namespace["z"] = archive
+            exec(compile(ast.Module(body=[assignments["members"]], type_ignores=[]),
+                         "<Dockerfile archive mapping>", "exec"), namespace)
         catalog = "google_seo_mcp/production_tools.json"
         assert catalog in namespace["members"] and catalog in namespace["source"]
-        assert namespace["members"][catalog] == namespace["source"][catalog]
-        guard = next(node for node in program.body if isinstance(node, ast.Assert)
-                     and ast.dump(node.test) == ast.dump(
-                         ast.parse("members == source", mode="eval").body))
-        # Require the guard after both mappings; an earlier/dead guard is not coverage.
+        guard = checks[ast.dump(ast.parse(guard_expression, mode="eval").body)]
         assert program.body.index(guard) > max(program.body.index(assignments[name])
                                                for name in ("members", "source"))
         check = compile(ast.Module(body=[guard], type_ignores=[]),
                         "<Dockerfile source/data equality>", "exec")
-        member = {catalog: namespace["members"][catalog]}
-        source = {catalog: namespace["source"][catalog]}
-        exec(check, {"members": member, "source": source})
-        for bad_members, bad_source in (({}, source), (member, {}),
-                                        ({catalog: member[catalog] + b"!"}, source),
-                                        (member, {catalog: source[catalog] + b"!"})):
+        exec(check, namespace)
+        member, source = namespace["members"], namespace["source"]
+        # Every copied file (including JSON and new modules) is bound by bytes.
+        for bad_members, bad_source in (({}, {}), ({}, source), (member, {}),
+                (member | {catalog: member[catalog] + b"!"}, source),
+                (member, source | {catalog: source[catalog] + b"!"}),
+                (member | {"google_seo_mcp/unexpected.json": b"{}"}, source)):
             with pytest.raises(AssertionError):
                 exec(check, {"members": bad_members, "source": bad_source})
     assert "COPY --from=wheel-builder /opt/venv /opt/venv" in docker
@@ -246,7 +258,7 @@ direct = package.read_text('direct_url.json')
 assert not direct or not json.loads(direct).get('dir_info', {}).get('editable', False)
 manifest = json.loads(
     resources.files('google_seo_mcp').joinpath('production_tools.json').read_text())
-assert manifest['version'] == 1 and len(manifest['tools']) == len(set(manifest['tools'])) == 46
+assert manifest['version'] == 1 and len(manifest['tools']) == len(set(manifest['tools'])) == 52
 assert set(manifest['tools']) == set(production_names)
 assert util.find_spec('advertools') is None and util.find_spec('twisted') is None
 assert 'advertools' not in sys.modules
@@ -275,7 +287,7 @@ print(json.dumps({'runtime_packages': len(actual), 'manifest_tools': len(manifes
     )
     result = subprocess.run([executable, '-c', GUARDED_BOOT + provenance + code, json.dumps([
         expected, sorted(FORBIDDEN), pip_pin.group(1), str(ROOT / 'src'),
-        sorted(ORIGINAL_PRODUCTION_NAMES | set(BING_NAMES)), LEGACY_NAMES + BING_NAMES,
+        sorted(ORIGINAL_PRODUCTION_NAMES | set(BING_NAMES) | PAGESPEED_NAMES), LEGACY_NAMES + BING_NAMES,
     ])], env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=40)
     _assert_child_provenance(proof)
     assert result.returncode == 0, result.stderr

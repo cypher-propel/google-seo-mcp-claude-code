@@ -22,7 +22,7 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_PIP = "26.2.1"  # Separately pinned/hash-checked in Dockerfile.
-# Independent hosted admission: frozen historical 35 plus the approved eleven Bing reads.
+# Independent hosted admission: historical 35, eleven Bing reads and six PageSpeed reads.
 EXPECTED_TOOLS = frozenset({
     "cross_gsc_to_ga4_journey", "cross_landing_page_full_diagnosis",
     "cross_multi_property_comparison", "cross_opportunity_matrix",
@@ -38,6 +38,9 @@ EXPECTED_TOOLS = frozenset({
     "bing_list_sites", "bing_rank_traffic_stats", "bing_query_stats", "bing_page_stats",
     "bing_page_query_stats", "bing_query_page_stats", "bing_crawl_stats", "bing_crawl_issues",
     "bing_url_info", "bing_list_sitemaps", "bing_sitemap_details",
+    "lighthouse_audit", "lighthouse_core_web_vitals",
+    "lighthouse_lcp_opportunities", "lighthouse_compare_mobile_desktop",
+    "lighthouse_seo_score", "crux_current",
 })
 FORBIDDEN = {
     "advertools",

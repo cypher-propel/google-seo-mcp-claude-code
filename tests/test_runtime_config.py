@@ -224,7 +224,7 @@ def test_bing_model_has_exactly_three_additive_fields():
         "google_approved_project_id",
     }
     assert set(ProductionRuntimeConfig.model_fields) == original | {
-        "bing_credentials_file", "require_bing_credentials",
+        "bing_credentials_file", "require_bing_credentials", "pagespeed_api_key_file",
     }
 
 

@@ -376,9 +376,15 @@ auth.configure_bing_auth(missing)
 tools.configure_bing_tools(BingReadClient())
 with patch.object(httpx, 'Client', side_effect=AssertionError('missing config HTTP')) as client:
     result = asyncio.run(call())
-    data = business(result)
-    assert data['data']['status'] == 'unavailable'
-    assert data['data']['error']['code'] == 'provider_not_configured'
+    if profile == 'hosted':
+        # Final egress cannot admit even an unavailable envelope without its
+        # own provider custody. Legacy business-envelope behavior is unchanged.
+        assert result['isError'] is True
+        assert result['content'][0]['text'] == 'provider_unavailable'
+    else:
+        data = business(result)
+        assert data['data']['status'] == 'unavailable'
+        assert data['data']['error']['code'] == 'provider_not_configured'
     client.assert_not_called()
 safe(result)
 finish(len(bad)+1)
@@ -435,11 +441,15 @@ auth.configure_bing_auth(missing)
 with patch.object(httpx, 'Client', side_effect=AssertionError('absent provider HTTP')) as client:
     for name, arguments in routes:
         result = asyncio.run(call(name, arguments))
-        data = business(result)
-        assert data['data']['status'] == 'unavailable'
-        assert data['data']['error']['code'] == 'provider_not_configured'
-        assert not data['data']['records']
-        assert data['_meta']['source'] == 'bing_webmaster'
+        if profile == 'hosted':
+            assert result['isError'] is True
+            assert result['content'][0]['text'] == 'provider_unavailable'
+        else:
+            data = business(result)
+            assert data['data']['status'] == 'unavailable'
+            assert data['data']['error']['code'] == 'provider_not_configured'
+            assert not data['data']['records']
+            assert data['_meta']['source'] == 'bing_webmaster'
         safe(result)
     client.assert_not_called()
 finish(len(routes))
@@ -610,6 +620,10 @@ result = asyncio.run(call('bing_query_page_stats', arguments))
 if stage == 'validation':
     assert result['isError'] is True
     assert result['content'][0]['text'] in ('invalid_request', 'invalid_tool_arguments')
+elif profile == 'hosted' and stage in ('missing', 'invalid'):
+    # Missing/invalid final scanner custody fails closed at the hosted boundary.
+    assert result['isError'] is True
+    assert result['content'][0]['text'] == 'provider_unavailable'
 else:
     payload = business(result)
     expected = {'missing':'provider_not_configured', 'invalid':'credentials_invalid',

@@ -42,6 +42,7 @@ from .runtime_config import (
     load_runtime_config,
 )
 from .tool_policy import ProductionToolPolicy, ToolPolicyError
+from . import pagespeed_auth
 
 _audit_log = logging.getLogger("google_seo_mcp.audit")
 _ORIGINAL_LOGGER_CALL_HANDLERS = logging.Logger.callHandlers
@@ -195,14 +196,19 @@ def _protect_hosted_result(result, tool_name):
         return (material(os.getenv('DATAFORSEO_LOGIN'), os.getenv('DATAFORSEO_PASSWORD'),
                          f"{os.getenv('DATAFORSEO_LOGIN')}:{os.getenv('DATAFORSEO_PASSWORD')}"),)
 
+    def pagespeed_set():
+        return (material(pagespeed_auth.load_hosted_key(), None, None),)
+
     provider = ('bing' if tool_name in _BING_TOOL_NAMES else
+                'pagespeed' if tool_name in pagespeed_auth.PAGESPEED_TOOL_NAMES else
                 'serp' if tool_name in {'serp_check', 'serp_aio_monitor',
                     'serp_paa_extractor', 'serp_competitor_intersect'} else
                 'google' if tool_name in ProductionToolPolicy().names else None)
     if provider is None:
         raise RuntimeError('provider_unavailable')
     sets = {}
-    for name, loader in (('google', google_set), ('bing', bing_set), ('serp', serp_set)):
+    for name, loader in (('google', google_set), ('bing', bing_set), ('serp', serp_set),
+                         ('pagespeed', pagespeed_set)):
         try:
             sets[name] = tuple(loader())
         except Exception:
@@ -338,6 +344,7 @@ class ProductionFastMCP(FastMCP):
             raise ToolPolicyError("invalid production configuration")
         auth_module.configure_hosted_auth(config)
         _configure_hosted_logging()
+        pagespeed_auth.configure_pagespeed_auth(config)
         self.runtime_config = config
         self.production_policy = ProductionToolPolicy()
         super().__init__(
