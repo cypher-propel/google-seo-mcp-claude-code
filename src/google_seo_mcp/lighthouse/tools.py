@@ -63,18 +63,85 @@ def _audit_summary(psi: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def lighthouse_audit(url: str, strategy: str = "mobile") -> dict:
-    """Run a full Lighthouse audit (mobile or desktop) via PageSpeed Insights v5.
+def _speed_checks(psi: dict[str, Any]) -> dict[str, Any]:
+    """Extract workbook speed checks from the same Lighthouse response."""
+    lr = psi.get("lighthouseResult", {})
+    audits = lr.get("audits", {})
+    checks = {"lighthouse_version": lr.get("lighthouseVersion")}
+    for field, audit_id in (
+        ("images", "image-delivery-insight"),
+        ("caching", "cache-insight"),
+        ("minify_css", "unminified-css"),
+        ("minify_javascript", "unminified-javascript"),
+        ("text_compression", "document-latency-insight"),
+        ("server_response", "server-response-time"),
+    ):
+        result = {"audit": (f"{audit_id}.usesCompression"
+                            if field == "text_compression" else audit_id)}
+        audit = audits.get(audit_id)
+        if audit is None:
+            result["status"] = "audit_absent"
+        else:
+            details = audit.get("details", {})
+            if field == "images":
+                items = details.get("items", [])
+                result.update({
+                    "score": audit.get("score"),
+                    "estimated_savings_bytes": sum(item.get("wastedBytes", 0) for item in items),
+                    "items": [{
+                        "url": item.get("url"),
+                        "total_bytes": item.get("totalBytes"),
+                        "wasted_bytes": item.get("wastedBytes"),
+                    } for item in sorted(items, key=lambda x: x.get("wastedBytes", 0),
+                                         reverse=True)[:10]],
+                })
+            elif field == "caching":
+                items = details.get("items", [])
+                result.update({
+                    "score": audit.get("score"),
+                    "item_count": len(items),
+                    "items": [{
+                        "url": item.get("url"),
+                        "cache_lifetime_ms": item.get("cacheLifetimeMs"),
+                        "total_bytes": item.get("totalBytes"),
+                    } for item in sorted(items, key=lambda x: x.get("totalBytes", 0),
+                                         reverse=True)[:10]],
+                })
+            elif field in {"minify_css", "minify_javascript"}:
+                result.update({
+                    "score": audit.get("score"),
+                    "estimated_savings_bytes": details.get("overallSavingsBytes"),
+                })
+            elif field == "text_compression":
+                compression = details.get("items", {}).get("usesCompression")
+                if compression is None:
+                    result["status"] = "audit_absent"
+                else:
+                    result["passed"] = compression.get("value")
+            else:
+                result["ms"] = audit.get("numericValue")
+        checks[field] = result
+    return checks
 
-    Returns scores (perf/a11y/best-practices/SEO 0-100) + Core Web Vitals.
+
+def lighthouse_audit(url: str, strategy: str = "mobile") -> dict:
+    """Run a full Lighthouse audit (mobile or desktop) via PageSpeed Insights v5. Returns scores (perf/a11y/best-practices/SEO 0-100), Core Web Vitals, and speed_checks: the image-delivery, cache-lifetime, minify CSS, minify JavaScript, text-compression and server-response-time results that the audit workbook's checks 22.6 to 22.10 read.
 
     Args:
         url: The page to audit (must be publicly reachable).
         strategy: "mobile" (default, what Google uses for ranking) or "desktop".
+
+    Returns:
+        Scores, Core Web Vitals and speed_checks from one PSI response. Image
+        estimated_savings_bytes is the sum of all item wastedBytes, before the
+        largest 10 items are selected; minify savings use overallSavingsBytes.
+        Missing audits return status audit_absent rather than guessed values.
     """
     psi = call_psi(url, strategy=strategy)
+    summary = _audit_summary(psi)
+    summary["speed_checks"] = _speed_checks(psi)
     return with_meta(
-        _audit_summary(psi),
+        summary,
         source=f"pagespeed_insights_v5.{strategy}",
         site_url=url,
     )

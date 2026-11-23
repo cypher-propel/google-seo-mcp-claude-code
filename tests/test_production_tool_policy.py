@@ -143,6 +143,23 @@ def test_catalog_is_exact_static_baseline_expansion_and_stdio_is_intact(hosted):
     assert hosted.settings.streamable_http_path == "/mcp"
 
 
+def test_lighthouse_speed_extension_preserves_catalog_and_input_schema(hosted):
+    # Pin the pre-SPD schema independently of the implementation/manifest.
+    assert len(EXPECTED) == 52
+    assert {tool.name for tool in hosted._tool_manager.list_tools()} == EXPECTED
+    assert ProductionToolPolicy().names == EXPECTED
+    tool = hosted._tool_manager.get_tool("lighthouse_audit")
+    assert tool.parameters == {
+        "properties": {
+            "url": {"title": "Url", "type": "string"},
+            "strategy": {"default": "mobile", "title": "Strategy", "type": "string"},
+        },
+        "required": ["url"],
+        "title": "lighthouse_auditArguments",
+        "type": "object",
+    }
+
+
 @pytest.mark.parametrize("name", sorted(EXCLUDED) + ALIASES + BING_FORBIDDEN)
 @pytest.mark.parametrize("seam", ["manager", "fastmcp", "sdk-handler"])
 def test_every_excluded_name_and_alias_denied_before_open_dns_or_socket(hosted, name, seam):
